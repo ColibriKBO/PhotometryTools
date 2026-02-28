@@ -185,6 +185,14 @@ def _build_ref_matrices(
     err_matrix = err_pivot[col_order].values.astype(float)
     w = np.array([weights[sid] for sid in col_order], dtype=float)
 
+    # Subtract each reference star's temporal median so all curves are in
+    # "deviation from mean" space.  Without this, the weighted-mean reference
+    # has an absolute level set by the ensemble's average brightness, which
+    # differs from every target star's brightness and produces a large,
+    # spurious constant offset in the differential light curve.
+    star_medians = np.nanmedian(mag_matrix, axis=0)  # (n_refs,)
+    mag_matrix = mag_matrix - star_medians[np.newaxis, :]
+
     valid_mask = np.isfinite(mag_matrix) & np.isfinite(err_matrix)
     # Effective (un-normalised) weights: zero out invalid entries
     w_eff = np.where(valid_mask, w[np.newaxis, :], 0.0)  # (n_epochs, n_refs)
@@ -391,7 +399,12 @@ def compute_differential_lightcurves(
             ref_for_target["ref_mag_err"] = mats["ref_err"]
 
         merged = src_rows.merge(ref_for_target, on=["filename", "obs_time"], how="left")
-        merged["diff_mag"] = merged["mag"] - merged["ref_mag"]
+
+        # Subtract this target's temporal median so the differential is in
+        # "deviation from mean" space, matching how the reference was built.
+        # A non-variable star will produce diff_mag ≈ 0 at all epochs.
+        target_median = merged["mag"].median()
+        merged["diff_mag"] = (merged["mag"] - target_median) - merged["ref_mag"]
         merged["diff_mag_err"] = np.sqrt(
             merged["mag_err"].fillna(0) ** 2 + merged["ref_mag_err"].fillna(0) ** 2
         )
