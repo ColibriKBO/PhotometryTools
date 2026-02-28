@@ -191,12 +191,12 @@ Pixels that fall **outside the overlap region** after the shift (e.g. sky area c
 
 #### 3b — Per-frame aperture re-centroiding
 
-Rounding the shift to an integer leaves a sub-pixel residual: sources in the shifted frame are not guaranteed to lie exactly at the reference-frame positions `(x_ref + dx, y_ref + dy)`. To account for this, each source is **re-centroided** in the shifted frame:
+Rounding the shift to an integer leaves a sub-pixel residual: the source may not fall exactly on the nearest pixel. To account for this, each source is **re-centroided** in the shifted frame:
 
-1. The nominal expected position after the integer shift is computed for every source.
-2. A square cutout of half-width `centroid_box_radius` pixels is extracted around each expected position.
-3. A **centre-of-mass centroid** (`photutils.centroids.centroid_com`) is computed on the cutout to obtain the refined sub-pixel position.
-4. Sources whose expected position falls outside the image boundary, or where the centroid is non-finite (e.g. an entirely NaN cutout at a frame edge), are assigned NaN positions and their measurements are set to NaN for that epoch.
+1. Because the integer shift moves each science-frame pixel at `(x_s, y_s)` to `(x_s + dx, y_s + dy)` ≈ `(x_ref, y_ref)`, sources in the shifted image land at approximately their **reference-frame positions**. The search box is therefore centred directly on `(x_ref, y_ref)`.
+2. The pixel at `(x_ref, y_ref)` in the shifted image is checked: if it is NaN (i.e. it falls inside the border region introduced by the integer shift, meaning the science frame did not cover that part of the sky), the source is assigned a NaN position and its measurement is set to NaN for that epoch.
+3. For sources in the valid region, a square cutout of half-width `centroid_box_radius` pixels is extracted around `(x_ref, y_ref)`.
+4. A **centre-of-mass centroid** (`photutils.centroids.centroid_com`) is computed on the cutout to obtain the refined sub-pixel position.
 
 The re-centroided positions are used **only for that individual frame**; the original reference-frame coordinates (`x_ref`, `y_ref`) are always stored in the output CSV so that sources can be identified consistently across epochs.
 

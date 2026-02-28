@@ -231,46 +231,59 @@ class TestRecentroidPositions:
 
     def test_recovers_correct_position_after_integer_shift(self):
         """
-        Given a star at a known location, an integer-shifted copy of the image,
-        and the correct shift_xy, recentroid must recover a position close to
-        the expected centroid in the shifted frame.
+        After align_image applies an integer shift, stars land at approximately
+        their reference-frame positions.  recentroid_positions must search at
+        the reference position and return a centroid close to it.
+
+        Setup: create a science image with the star at (cx - dx, cy - dy).
+        Applying shift (dx, dy) moves the star to (cx, cy) = reference position.
         """
         shape = (128, 128)
-        cx, cy = 60.0, 55.0          # true star position in reference frame
+        cx, cy = 60.0, 55.0   # reference-frame star position
         fwhm = 4.0
-        dx, dy = 7, -5              # integer shift applied
+        dx, dy = 7, -5        # integer shift that align_image would apply
 
-        # Reference image: single star
-        ref = gaussian_source(cx, cy, 1000.0, fwhm, shape)
-
-        # Shifted image: star moves to (cx+dx, cy+dy)
+        # Science frame: star pre-offset so the shift puts it at (cx, cy)
         from scipy.ndimage import shift as ndi_shift
-        shifted = ndi_shift(ref, shift=(dy, dx), order=0, mode="constant", cval=np.nan)
+        science_star_x = cx - dx   # 53.0
+        science_star_y = cy - dy   # 60.0
+        science = gaussian_source(science_star_x, science_star_y, 1000.0, fwhm, shape)
+
+        # Apply integer shift → star should land at (cx, cy) in aligned image
+        aligned = ndi_shift(science, shift=(dy, dx), order=0, mode="constant", cval=np.nan)
 
         ref_positions = np.array([[cx, cy]])
-        new_pos = recentroid_positions(shifted, ref_positions, (dx, dy),
+        new_pos = recentroid_positions(aligned, ref_positions, (dx, dy),
                                        search_box_radius=8)
 
-        expected_x = cx + dx
-        expected_y = cy + dy
         assert new_pos.shape == (1, 2)
         assert np.all(np.isfinite(new_pos[0])), "Re-centroided position should be finite"
-        assert abs(new_pos[0, 0] - expected_x) < 1.0, \
-            f"x centroid off by {abs(new_pos[0, 0] - expected_x):.2f} px"
-        assert abs(new_pos[0, 1] - expected_y) < 1.0, \
-            f"y centroid off by {abs(new_pos[0, 1] - expected_y):.2f} px"
+        assert abs(new_pos[0, 0] - cx) < 1.0, \
+            f"x centroid off by {abs(new_pos[0, 0] - cx):.2f} px (expected ≈{cx})"
+        assert abs(new_pos[0, 1] - cy) < 1.0, \
+            f"y centroid off by {abs(new_pos[0, 1] - cy):.2f} px (expected ≈{cy})"
 
-    def test_source_outside_image_returns_nan(self):
-        """A source shifted beyond the image boundary must return NaN."""
+    def test_source_in_nan_border_returns_nan(self):
+        """
+        A reference position that falls inside the NaN border of the shifted
+        image (i.e. the science frame did not cover that sky region) must
+        return NaN.
+
+        With dx=+10 the left 10 columns of the shifted image are NaN.
+        A reference position at x=5 is inside that border.
+        """
         shape = (64, 64)
-        ref_positions = np.array([[5.0, 5.0]])   # near edge
-        dx, dy = -20, 0                           # shift left by 20 → off the image
+        from scipy.ndimage import shift as ndi_shift
+        # Science frame: uniform background, shift right by 10 px → left 10 cols NaN
+        science = np.ones(shape)
+        aligned = ndi_shift(science, shift=(0, 10), order=0, mode="constant", cval=np.nan)
 
-        data = np.ones(shape)
-        new_pos = recentroid_positions(data, ref_positions, (dx, dy),
+        # Reference position at x=5 is inside the NaN border (cols 0-9 are NaN)
+        ref_positions = np.array([[5.0, 32.0]])
+        new_pos = recentroid_positions(aligned, ref_positions, (10, 0),
                                        search_box_radius=5)
 
-        assert np.all(np.isnan(new_pos[0])), "Out-of-frame source should be NaN"
+        assert np.all(np.isnan(new_pos[0])), "Position in NaN border should return NaN"
 
     def test_output_shape_matches_input(self):
         """Output array must have the same shape as ref_positions."""
@@ -278,6 +291,7 @@ class TestRecentroidPositions:
         n_sources = 10
         rng = np.random.default_rng(7)
         ref_positions = rng.uniform(20, 108, (n_sources, 2))
+        # Image has stars at the reference positions (zero shift case)
         data = make_star_field(
             [(x, y, 500.0) for x, y in ref_positions], shape=shape
         )
@@ -298,26 +312,31 @@ class TestRecentroidPositions:
         assert abs(new_pos[0, 0] - cx) < 0.5, "x centroid should be close to input"
         assert abs(new_pos[0, 1] - cy) < 0.5, "y centroid should be close to input"
 
-    def test_multiple_sources_some_outside(self):
-        """Only in-frame sources should have finite positions; others should be NaN."""
+    def test_multiple_sources_one_in_nan_border(self):
+        """
+        Sources whose reference position is inside the NaN border are NaN;
+        sources in the valid region have finite centroids.
+
+        With dx=+10: NaN border occupies columns 0-9.
+        - ref at ( 5, 32): in NaN border → NaN
+        - ref at (40, 32): in valid region → finite
+        """
         shape = (64, 64)
-        # Two sources: one will shift inside, one outside
-        ref_positions = np.array([
-            [32.0, 32.0],   # well inside, stays inside with shift (+5, 0)
-            [60.0, 32.0],   # after shift (+10, 0): 70 > 64 → NaN
-        ])
         dx, dy = 10, 0
         from scipy.ndimage import shift as ndi_shift
-        data = make_star_field(
-            [(x, y, 500.0) for x, y in ref_positions], shape=shape
-        )
-        # Simulate integer shift of the data
-        shifted = ndi_shift(data, shift=(dy, dx), order=0, mode="constant", cval=np.nan)
 
-        new_pos = recentroid_positions(shifted, ref_positions, (dx, dy), search_box_radius=5)
+        # Science frame: star at (30, 32) which will land at (40, 32) after dx=+10
+        science = make_star_field([(30.0, 32.0, 500.0)], shape=shape)
+        aligned = ndi_shift(science, shift=(dy, dx), order=0, mode="constant", cval=np.nan)
 
-        assert np.all(np.isfinite(new_pos[0])), "In-frame source should have finite centroid"
-        assert np.all(np.isnan(new_pos[1])), "Out-of-frame source should be NaN"
+        ref_positions = np.array([
+            [5.0, 32.0],   # inside NaN border (col 5 < dx=10)
+            [40.0, 32.0],  # in valid region, star landed here
+        ])
+        new_pos = recentroid_positions(aligned, ref_positions, (dx, dy), search_box_radius=5)
+
+        assert np.all(np.isnan(new_pos[0])), "Source in NaN border should be NaN"
+        assert np.all(np.isfinite(new_pos[1])), "Source in valid region should have finite centroid"
 
     def test_nan_pixels_in_cutout_do_not_crash(self):
         """NaN pixels inside the search box (e.g. border fill) must not raise."""
@@ -341,34 +360,39 @@ class TestRecentroidPositions:
 class TestAlignRecentroidRoundTrip:
     """
     Verify that aligning an image and then re-centroiding yields aperture
-    positions that are within 1 pixel of the true star locations.
+    positions that are close to the reference-frame star locations.
     """
 
     def test_round_trip_position_accuracy(self):
         """
-        Using a mocked transform, check the full align-then-recentroid pipeline
-        recovers the shifted star positions to sub-pixel accuracy.
+        Full pipeline: science frame with star at (cx-dx, cy-dy) → align_image
+        with mocked transform → recentroid_positions → refined position ≈ (cx, cy).
         """
         shape = (128, 128)
-        true_cx, true_cy = 64.0, 60.0
+        cx, cy = 64.0, 60.0   # reference-frame star position
         fwhm = 4.0
-        dx, dy = 8, -5
+        dx, dy = 8, -5        # integer shift (source→reference mapping)
 
-        ref_image = gaussian_source(true_cx, true_cy, 1000.0, fwhm, shape)
-        ref_positions = np.array([[true_cx, true_cy]])
+        # Science frame: star pre-offset so the shift lands it at (cx, cy)
+        science_image = gaussian_source(cx - dx, cy - dy, 1000.0, fwhm, shape)
+
+        # Reference image: star at (cx, cy)
+        ref_image = gaussian_source(cx, cy, 1000.0, fwhm, shape)
+        ref_positions = np.array([[cx, cy]])
 
         mock_transform = MagicMock()
         mock_transform.translation = (float(dx), float(dy))
 
         with patch("astroalign.find_transform", return_value=(mock_transform, None)):
-            shifted, bad_mask, shift_xy = align_image(ref_image, ref_image)
+            shifted, bad_mask, shift_xy = align_image(science_image, ref_image)
 
         assert shifted is not None
 
         new_pos = recentroid_positions(shifted, ref_positions, shift_xy, search_box_radius=8)
 
         assert np.all(np.isfinite(new_pos[0])), "Round-trip should yield finite position"
-        assert abs(new_pos[0, 0] - (true_cx + dx)) < 1.0, \
-            f"x position error too large: {abs(new_pos[0, 0] - (true_cx + dx)):.2f} px"
-        assert abs(new_pos[0, 1] - (true_cy + dy)) < 1.0, \
-            f"y position error too large: {abs(new_pos[0, 1] - (true_cy + dy)):.2f} px"
+        assert abs(new_pos[0, 0] - cx) < 1.0, \
+            f"x position error too large: {abs(new_pos[0, 0] - cx):.2f} px"
+        assert abs(new_pos[0, 1] - cy) < 1.0, \
+            f"y position error too large: {abs(new_pos[0, 1] - cy):.2f} px"
+

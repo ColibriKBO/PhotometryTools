@@ -144,11 +144,24 @@ def recentroid_positions(
     """
     Re-centroid sources in an integer-shifted image.
 
-    After an integer-pixel shift the nominal position of each source in the
-    shifted frame is ``(x_ref + dx, y_ref + dy)``.  The sub-pixel residual
-    that was discarded when the shift was rounded means a source may not fall
-    exactly on that pixel, so this function refines each position with a
-    centroid-of-mass fit inside a small search box.
+    When ``align_image`` applies ``scipy.ndimage.shift(source, (dy, dx))``, it
+    moves each source from its original position ``(x_s, y_s)`` to
+    ``(x_s + dx, y_s + dy)``.  Because the transform found by ``astroalign``
+    maps source coordinates onto the reference frame, ``(x_s + dx, y_s + dy)``
+    is approximately the **reference-frame position** ``(x_ref, y_ref)`` of
+    that source.  In other words, after the integer shift the stars sit at
+    roughly the same pixel coordinates they occupy in the reference image.
+
+    The only adjustment needed is a sub-pixel refinement to correct for the
+    0.5-pixel rounding error introduced when the continuous translation was
+    rounded to an integer.  This function therefore centres its search box on
+    ``(x_ref, y_ref)`` directly and uses a centre-of-mass centroid to obtain
+    the refined position.
+
+    ``shift_xy`` is used solely to determine whether the valid (non-NaN)
+    region of the shifted image covers a given reference position.  Sources
+    whose reference position falls inside the NaN border that results from the
+    integer shift are given NaN positions.
 
     Parameters
     ----------
@@ -160,14 +173,15 @@ def recentroid_positions(
         The ``(dx, dy)`` integer shift that was applied to produce *data*.
     search_box_radius : int
         Half-width (pixels) of the centroiding search box around each
-        expected source position.
+        reference position.
 
     Returns
     -------
     ndarray, shape (N, 2)
-        Refined ``(x, y)`` positions in *data* coordinates.
-        Rows are NaN for sources that fall outside the image extent or
-        where centroiding produces a non-finite result.
+        Refined ``(x, y)`` positions in *data* coordinates (close to the
+        reference positions for successfully aligned sources).
+        Rows are NaN for sources that fall inside the NaN border or outside
+        the image extent, or where centroiding produces a non-finite result.
     """
     from photutils.centroids import centroid_com
 
@@ -177,18 +191,29 @@ def recentroid_positions(
     r = int(search_box_radius)
 
     for i, (x, y) in enumerate(ref_positions):
-        # Nominal position after integer shift
-        x_exp = x + dx
-        y_exp = y + dy
+        # After the integer shift, stars are at their reference-frame positions.
+        # Just verify that (x, y) is within the valid (non-NaN) region.
+        x_exp = x
+        y_exp = y
+
+        # The valid column range after a shift of dx is [max(0,dx), min(nx, nx+dx)).
+        # A source at x_exp is valid iff max(0,dx) <= x_exp < min(nx, nx+dx),
+        # or equivalently iff the pixel at (y_exp, x_exp) is not NaN.
+        ix = int(round(x_exp))
+        iy = int(round(y_exp))
+        if not (0 <= ix < nx and 0 <= iy < ny):
+            continue  # reference position out of bounds
+        if not np.isfinite(data[iy, ix]):
+            continue  # this pixel is in the NaN border — no source data here
 
         # Search-box bounds, clamped to image extent
-        x0 = max(0, int(x_exp) - r)
-        x1 = min(nx, int(x_exp) + r + 1)
-        y0 = max(0, int(y_exp) - r)
-        y1 = min(ny, int(y_exp) + r + 1)
+        x0 = max(0, ix - r)
+        x1 = min(nx, ix + r + 1)
+        y0 = max(0, iy - r)
+        y1 = min(ny, iy + r + 1)
 
         if x1 <= x0 or y1 <= y0:
-            continue  # source shifted outside image → leave as NaN
+            continue
 
         cutout = data[y0:y1, x0:x1].copy()
         cutout[~np.isfinite(cutout)] = 0.0  # centroid_com requires finite values
