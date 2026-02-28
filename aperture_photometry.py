@@ -42,6 +42,27 @@ def read_fits(path: Path, extension: int) -> np.ndarray:
     return data
 
 
+def read_fits_datetime(path: Path, extension: int) -> str | None:
+    """Try to read an observation timestamp from the FITS header.
+
+    Attempts keywords in order: DATE-OBS, MJD-OBS (converted to ISO), JD
+    (converted to ISO). Returns an ISO-format string or None if unavailable.
+    """
+    try:
+        from astropy.time import Time
+        with fits.open(path) as hdul:
+            hdr = hdul[extension].header
+        if "DATE-OBS" in hdr:
+            return str(hdr["DATE-OBS"])
+        if "MJD-OBS" in hdr:
+            return Time(float(hdr["MJD-OBS"]), format="mjd").isot
+        if "JD" in hdr:
+            return Time(float(hdr["JD"]), format="jd").isot
+    except Exception:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Source detection
 # ---------------------------------------------------------------------------
@@ -280,9 +301,9 @@ def plot_snr_vs_magnitude(df: pd.DataFrame, output_path: Path):
 
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.scatter(summary["mag_median"], summary["snr_median"], s=15, alpha=0.7, color="steelblue")
-    ax.set_xlabel("Instrumental Magnitude (median)", fontsize=13)
-    ax.set_ylabel("SNR (median)", fontsize=13)
-    ax.set_title("SNR vs Instrumental Magnitude", fontsize=14)
+    ax.set_xlabel("Instrumental Magnitude (median over epochs)", fontsize=13)
+    ax.set_ylabel("Median Per-Epoch SNR", fontsize=13)
+    ax.set_title("Median Per-Epoch SNR vs Instrumental Magnitude", fontsize=14)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     fig.savefig(output_path, dpi=150)
@@ -318,40 +339,60 @@ def plot_temporal_snr_vs_magnitude(df: pd.DataFrame, output_path: Path):
 
 
 def plot_lightcurves(df: pd.DataFrame, output_dir: Path):
-    """Save one flux light curve plot per source into output_dir."""
+    """Save one flux light curve plot per source into output_dir.
+
+    Uses the ``obs_time`` column for the x-axis if valid datetimes are present;
+    otherwise falls back to integer epoch index.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Map filenames to integer epoch index for a clean x-axis
-    filenames = sorted(df["filename"].unique())
-    fname_to_idx = {f: i for i, f in enumerate(filenames)}
+    # Attempt to parse obs_time into datetimes; fall back to epoch index on failure
     df = df.copy()
-    df["epoch"] = df["filename"].map(fname_to_idx)
+    use_datetime = False
+    if "obs_time" in df.columns:
+        df["obs_dt"] = pd.to_datetime(df["obs_time"], errors="coerce")
+        valid_times = df["obs_dt"].notna().sum()
+        use_datetime = valid_times > 0
+        if not use_datetime:
+            log.warning("obs_time column present but no parseable datetimes; using epoch index.")
+
+    if not use_datetime:
+        filenames = sorted(df["filename"].unique())
+        fname_to_idx = {f: i for i, f in enumerate(filenames)}
+        df["epoch"] = df["filename"].map(fname_to_idx)
 
     source_ids = sorted(df["source_id"].unique())
     log.info(f"Saving {len(source_ids)} light curve plots...")
 
     for sid in source_ids:
-        src = df[df["source_id"] == sid].sort_values("epoch")
-        epochs = src["epoch"].values
+        src = df[df["source_id"] == sid].sort_values("obs_dt" if use_datetime else "epoch")
         flux = src["flux"].values
         flux_err = src["flux_err"].values
+        xvals = src["obs_dt"].values if use_datetime else src["epoch"].values
 
-        # Skip sources with no valid measurements at all
         valid = np.isfinite(flux)
         if valid.sum() == 0:
             continue
 
         fig, ax = plt.subplots(figsize=(10, 4))
         ax.errorbar(
-            epochs[valid], flux[valid], yerr=flux_err[valid],
+            xvals[valid], flux[valid], yerr=flux_err[valid],
             fmt="o", color="steelblue", ecolor="lightsteelblue",
             capsize=3, markersize=4, linewidth=0.8,
         )
-        ax.set_xlabel("Epoch (image index)", fontsize=12)
+
+        if use_datetime:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M"))
+            fig.autofmt_xdate(rotation=30, ha="right")
+            ax.set_xlabel("Observation Time (UTC)", fontsize=12)
+        else:
+            ax.set_xlabel("Epoch (image index)", fontsize=12)
+
         ax.set_ylabel("Flux (counts)", fontsize=12)
         x_ref = src["x_ref"].iloc[0]
         y_ref = src["y_ref"].iloc[0]
@@ -408,6 +449,7 @@ def main():
     for i, fits_path in enumerate(fits_files):
         log.info(f"[{i+1}/{len(fits_files)}] {fits_path.name}")
         data = read_fits(fits_path, cfg["fits_extension"])
+        obs_time = read_fits_datetime(fits_path, cfg["fits_extension"])
 
         # Align if requested and not the reference
         bad_mask = None
@@ -417,7 +459,7 @@ def main():
                 for sid, (x, y) in zip(source_ids, positions):
                     records.append({
                         "source_id": int(sid), "x_ref": x, "y_ref": y,
-                        "filename": fits_path.name,
+                        "filename": fits_path.name, "obs_time": obs_time,
                         "flux": np.nan, "flux_err": np.nan,
                         "mag": np.nan, "mag_err": np.nan,
                         "snr": np.nan, "sky_bkg": np.nan,
@@ -437,6 +479,7 @@ def main():
                 "x_ref": positions[j, 0],
                 "y_ref": positions[j, 1],
                 "filename": fits_path.name,
+                "obs_time": obs_time,
                 "flux": phot["flux"][j],
                 "flux_err": phot["flux_err"][j],
                 "mag": phot["mag"][j],
