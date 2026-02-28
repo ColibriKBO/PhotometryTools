@@ -1,0 +1,227 @@
+"""
+Diagnostic plotting routines.
+
+All functions write plot files to disk and return None.  Matplotlib is
+imported lazily inside each function so that the rest of the package works
+in headless / no-display environments without any extra configuration.
+"""
+
+import logging
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+log = logging.getLogger(__name__)
+
+# Use a non-interactive backend in every function to avoid display issues
+_MPL_BACKEND = "Agg"
+
+
+def plot_reference_image(
+    ref_data: np.ndarray,
+    positions: np.ndarray,
+    kept_ids: set,
+    output_path: Path,
+) -> None:
+    """Save reference image with detected sources overlaid.
+
+    Sources that passed the coverage filter are shown in green; dropped
+    sources are shown in red.
+
+    Parameters
+    ----------
+    ref_data : ndarray
+        2-D reference science image.
+    positions : ndarray, shape (N, 2)
+        ``(x, y)`` pixel positions of all detected sources.
+    kept_ids : set
+        Source IDs that survived the coverage filter.
+    output_path : Path
+        Destination file for the saved plot (PNG recommended).
+    """
+    import matplotlib
+    matplotlib.use(_MPL_BACKEND)
+    import matplotlib.pyplot as plt
+    from astropy.visualization import ZScaleInterval
+
+    interval = ZScaleInterval()
+    vmin, vmax = interval.get_limits(ref_data)
+
+    kept_mask = np.array([i in kept_ids for i in range(len(positions))])
+    dropped_mask = ~kept_mask
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.imshow(
+        ref_data, origin="lower", cmap="gray",
+        vmin=vmin, vmax=vmax, interpolation="nearest",
+    )
+
+    if kept_mask.any():
+        ax.scatter(
+            positions[kept_mask, 0], positions[kept_mask, 1],
+            s=80, facecolors="none", edgecolors="limegreen", linewidths=0.8,
+            label=f"Passed coverage ({kept_mask.sum()})",
+        )
+    if dropped_mask.any():
+        ax.scatter(
+            positions[dropped_mask, 0], positions[dropped_mask, 1],
+            s=80, facecolors="none", edgecolors="red", linewidths=0.8,
+            label=f"Dropped by coverage filter ({dropped_mask.sum()})",
+        )
+
+    ax.set_title("Reference Image — Detected Sources", fontsize=14)
+    ax.set_xlabel("X (px)")
+    ax.set_ylabel("Y (px)")
+    ax.legend(loc="upper right", fontsize=10)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    log.info(f"Saved reference image plot → {output_path}")
+
+
+def plot_snr_vs_magnitude(df: pd.DataFrame, output_path: Path) -> None:
+    """Save a per-source median SNR vs instrumental magnitude scatter plot.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Photometry table with columns ``source_id``, ``mag``, and ``snr``.
+    output_path : Path
+        Destination file for the saved plot.
+    """
+    import matplotlib
+    matplotlib.use(_MPL_BACKEND)
+    import matplotlib.pyplot as plt
+
+    summary = df.groupby("source_id").agg(
+        mag_median=("mag", "median"),
+        snr_median=("snr", "median"),
+    ).dropna()
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.scatter(
+        summary["mag_median"], summary["snr_median"],
+        s=15, alpha=0.7, color="steelblue",
+    )
+    ax.set_xlabel("Instrumental Magnitude (median over epochs)", fontsize=13)
+    ax.set_ylabel("Median Per-Epoch SNR", fontsize=13)
+    ax.set_title("Median Per-Epoch SNR vs Instrumental Magnitude", fontsize=14)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    log.info(f"Saved SNR vs magnitude plot → {output_path}")
+
+
+def plot_temporal_snr_vs_magnitude(df: pd.DataFrame, output_path: Path) -> None:
+    """Save a per-source temporal SNR vs instrumental magnitude scatter plot.
+
+    Temporal SNR = median(flux) / std(flux) across all valid epochs.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Photometry table with columns ``source_id``, ``mag``, and
+        ``temporal_snr``.
+    output_path : Path
+        Destination file for the saved plot.
+    """
+    import matplotlib
+    matplotlib.use(_MPL_BACKEND)
+    import matplotlib.pyplot as plt
+
+    summary = (
+        df.groupby("source_id")
+        .agg(mag_median=("mag", "median"), temporal_snr=("temporal_snr", "first"))
+        .dropna()
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.scatter(
+        summary["mag_median"], summary["temporal_snr"],
+        s=15, alpha=0.7, color="darkorange",
+    )
+    ax.set_xlabel("Instrumental Magnitude (median)", fontsize=13)
+    ax.set_ylabel("Temporal SNR  [median flux / std flux]", fontsize=13)
+    ax.set_title("Temporal SNR vs Instrumental Magnitude", fontsize=14)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    log.info(f"Saved temporal SNR vs magnitude plot → {output_path}")
+
+
+def plot_lightcurves(df: pd.DataFrame, output_dir: Path) -> None:
+    """Save one flux light-curve plot per source into *output_dir*.
+
+    Uses the ``obs_time`` column for the x-axis when valid datetimes are
+    present; otherwise falls back to an integer epoch index.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Photometry table with columns ``source_id``, ``filename``,
+        ``obs_time``, ``flux``, ``flux_err``, ``x_ref``, ``y_ref``.
+    output_dir : Path
+        Directory into which ``source_NNNN.png`` files are written
+        (created if it does not exist).
+    """
+    import matplotlib
+    matplotlib.use(_MPL_BACKEND)
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    df = df.copy()
+    use_datetime = False
+    if "obs_time" in df.columns:
+        df["obs_dt"] = pd.to_datetime(df["obs_time"], errors="coerce")
+        valid_times = df["obs_dt"].notna().sum()
+        use_datetime = valid_times > 0
+        if not use_datetime:
+            log.warning("obs_time column present but no parseable datetimes; using epoch index.")
+
+    if not use_datetime:
+        filenames = sorted(df["filename"].unique())
+        fname_to_idx = {f: i for i, f in enumerate(filenames)}
+        df["epoch"] = df["filename"].map(fname_to_idx)
+
+    source_ids = sorted(df["source_id"].unique())
+    log.info(f"Saving {len(source_ids)} light curve plots...")
+
+    for sid in source_ids:
+        src = df[df["source_id"] == sid].sort_values("obs_dt" if use_datetime else "epoch")
+        flux = src["flux"].values
+        flux_err = src["flux_err"].values
+        xvals = src["obs_dt"].values if use_datetime else src["epoch"].values
+
+        valid = np.isfinite(flux)
+        if valid.sum() == 0:
+            continue
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.errorbar(
+            xvals[valid], flux[valid], yerr=flux_err[valid],
+            fmt="o", color="steelblue", ecolor="lightsteelblue",
+            capsize=3, markersize=4, linewidth=0.8,
+        )
+
+        if use_datetime:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M"))
+            fig.autofmt_xdate(rotation=30, ha="right")
+            ax.set_xlabel("Observation Time (UTC)", fontsize=12)
+        else:
+            ax.set_xlabel("Epoch (image index)", fontsize=12)
+
+        ax.set_ylabel("Flux (counts)", fontsize=12)
+        x_ref = src["x_ref"].iloc[0]
+        y_ref = src["y_ref"].iloc[0]
+        ax.set_title(f"Source {sid:04d}  (x={x_ref:.1f}, y={y_ref:.1f})", fontsize=13)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        fig.savefig(output_dir / f"source_{sid:04d}.png", dpi=100)
+        plt.close(fig)
+
+    log.info(f"Light curve plots saved to {output_dir}")

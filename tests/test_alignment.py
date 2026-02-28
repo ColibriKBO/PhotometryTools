@@ -17,7 +17,7 @@ import pytest
 # Ensure the project root is on the path so the module can be imported
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from aperture_photometry import align_image, recentroid_positions
+from src.alignment import align_image, recentroid_positions
 
 
 # ---------------------------------------------------------------------------
