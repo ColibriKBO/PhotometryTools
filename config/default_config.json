@@ -1,0 +1,11 @@
+{
+    "aperture_radius": 5.0,
+    "annulus_r_in": 8.0,
+    "annulus_r_out": 12.0,
+    "detection_fwhm": 3.0,
+    "detection_threshold": 5.0,
+    "fits_extension": 0,
+    "align": true,
+    "coverage_min_fraction": 0.9,
+    "gain": 1.0
+}

@@ -1,0 +1,6 @@
+astropy
+photutils
+astroalign
+numpy
+pandas
+matplotlib
