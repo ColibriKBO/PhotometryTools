@@ -7,5 +7,6 @@
     "fits_extension": 0,
     "align": true,
     "coverage_min_fraction": 0.9,
-    "gain": 1.0
+    "gain": 1.0,
+    "centroid_box_radius": 5
 }

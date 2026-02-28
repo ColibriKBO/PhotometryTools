@@ -86,28 +86,123 @@ def detect_sources(data: np.ndarray, fwhm: float, threshold_sigma: float) -> np.
 
 def align_image(
     source: np.ndarray, target: np.ndarray
-) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int]] | tuple[None, None, None]:
     """
-    Align source onto target frame using astroalign.
+    Align source onto target frame using a nearest integer-pixel shift (no
+    sub-pixel interpolation).
+
+    ``astroalign`` is used to determine the best-fit affine transform between
+    the two images.  Only the translation component of that transform is
+    retained; it is rounded to the nearest whole pixel and applied with
+    ``scipy.ndimage.shift`` at ``order=0`` (nearest-neighbour).  Because the
+    shift is an exact integer number of pixels, each output pixel receives the
+    value of exactly one input pixel — no blending or interpolation occurs.
 
     Returns
     -------
-    aligned : ndarray
-        Source image warped into the target frame. Pixels with no source data
-        (outside the dither overlap region) are filled with NaN.
+    shifted : ndarray
+        Source image shifted by integer pixels onto the target frame.
+        Border pixels with no source data are filled with NaN.
     bad_mask : ndarray of bool
-        True where aligned pixels are NaN (no coverage). Apertures that
+        True where shifted pixels are NaN (no coverage). Apertures that
         overlap any True pixel will be set to NaN in measure_photometry.
-    Returns (None, None) on failure.
+    shift_xy : tuple[int, int]
+        The ``(dx, dy)`` integer pixel shift applied, in (column, row) order.
+    Returns (None, None, None) on failure.
     """
     try:
         import astroalign as aa
-        aligned, _ = aa.register(source, target, fill_value=np.nan)
-        bad_mask = ~np.isfinite(aligned)
-        return aligned, bad_mask
+        from scipy.ndimage import shift as ndi_shift
+
+        transform, _ = aa.find_transform(source, target)
+        tx, ty = transform.translation
+        dx = int(round(tx))
+        dy = int(round(ty))
+
+        # order=0 → nearest-neighbour; for an integer shift this is equivalent
+        # to array slicing — no pixel blending whatsoever.
+        shifted = ndi_shift(
+            source.astype(np.float64),
+            shift=(dy, dx),
+            order=0,
+            mode="constant",
+            cval=np.nan,
+        )
+        bad_mask = ~np.isfinite(shifted)
+        return shifted, bad_mask, (dx, dy)
     except Exception as e:
         log.warning(f"Alignment failed: {e}. Photometry for this image will be NaN.")
-        return None, None
+        return None, None, None
+
+
+def recentroid_positions(
+    data: np.ndarray,
+    ref_positions: np.ndarray,
+    shift_xy: tuple[int, int],
+    search_box_radius: int = 5,
+) -> np.ndarray:
+    """
+    Re-centroid sources in an integer-shifted image.
+
+    After an integer-pixel shift the nominal position of each source in the
+    shifted frame is ``(x_ref + dx, y_ref + dy)``.  The sub-pixel residual
+    that was discarded when the shift was rounded means a source may not fall
+    exactly on that pixel, so this function refines each position with a
+    centroid-of-mass fit inside a small search box.
+
+    Parameters
+    ----------
+    data : ndarray
+        The shifted image (may contain NaN in border regions).
+    ref_positions : ndarray, shape (N, 2)
+        Source ``(x, y)`` pixel positions in the reference frame.
+    shift_xy : tuple[int, int]
+        The ``(dx, dy)`` integer shift that was applied to produce *data*.
+    search_box_radius : int
+        Half-width (pixels) of the centroiding search box around each
+        expected source position.
+
+    Returns
+    -------
+    ndarray, shape (N, 2)
+        Refined ``(x, y)`` positions in *data* coordinates.
+        Rows are NaN for sources that fall outside the image extent or
+        where centroiding produces a non-finite result.
+    """
+    from photutils.centroids import centroid_com
+
+    dx, dy = shift_xy
+    ny, nx = data.shape
+    new_positions = np.full_like(ref_positions, np.nan)
+    r = int(search_box_radius)
+
+    for i, (x, y) in enumerate(ref_positions):
+        # Nominal position after integer shift
+        x_exp = x + dx
+        y_exp = y + dy
+
+        # Search-box bounds, clamped to image extent
+        x0 = max(0, int(x_exp) - r)
+        x1 = min(nx, int(x_exp) + r + 1)
+        y0 = max(0, int(y_exp) - r)
+        y1 = min(ny, int(y_exp) + r + 1)
+
+        if x1 <= x0 or y1 <= y0:
+            continue  # source shifted outside image → leave as NaN
+
+        cutout = data[y0:y1, x0:x1].copy()
+        cutout[~np.isfinite(cutout)] = 0.0  # centroid_com requires finite values
+
+        if cutout.sum() <= 0:
+            continue  # no usable signal in the box
+
+        cx, cy = centroid_com(cutout)
+        if not (np.isfinite(cx) and np.isfinite(cy)):
+            continue
+
+        new_positions[i] = [x0 + cx, y0 + cy]
+
+    return new_positions
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +539,8 @@ def main():
     positions = detect_sources(ref_data, cfg["detection_fwhm"], cfg["detection_threshold"])
     source_ids = np.arange(len(positions))
 
+    centroid_box_radius = int(cfg.get("centroid_box_radius", 5))
+
     # Photometry loop
     records = []
     for i, fits_path in enumerate(fits_files):
@@ -453,8 +550,9 @@ def main():
 
         # Align if requested and not the reference
         bad_mask = None
+        frame_positions = positions  # default: use reference positions as-is
         if cfg["align"] and i > 0:
-            aligned, bad_mask = align_image(data, ref_data)
+            aligned, bad_mask, shift_xy = align_image(data, ref_data)
             if aligned is None:
                 for sid, (x, y) in zip(source_ids, positions):
                     records.append({
@@ -467,25 +565,49 @@ def main():
                 continue
             data = aligned
 
-        phot = measure_photometry(
-            data, positions,
-            cfg["aperture_radius"], cfg["annulus_r_in"], cfg["annulus_r_out"], cfg["gain"],
-            bad_mask=bad_mask,
-        )
+            # Re-centroid in the integer-shifted frame so apertures are
+            # precisely centred despite the sub-pixel residual from rounding.
+            frame_positions = recentroid_positions(
+                data, positions, shift_xy, centroid_box_radius
+            )
+            n_lost = int(np.sum(~np.all(np.isfinite(frame_positions), axis=1)))
+            if n_lost:
+                log.debug(
+                    f"  {n_lost} source(s) outside image after shift "
+                    f"(dx={shift_xy[0]}, dy={shift_xy[1]}) — set to NaN."
+                )
+
+        # Separate valid and invalid (NaN) positions before calling photutils.
+        valid_mask = np.all(np.isfinite(frame_positions), axis=1)
+        nan_result = {k: np.nan for k in ("flux", "flux_err", "mag", "mag_err", "snr", "sky_bkg")}
+
+        if valid_mask.any():
+            phot_valid = measure_photometry(
+                data, frame_positions[valid_mask],
+                cfg["aperture_radius"], cfg["annulus_r_in"], cfg["annulus_r_out"], cfg["gain"],
+                bad_mask=bad_mask,
+            )
+            # Index into the valid-only results using a running counter
+            valid_indices = np.where(valid_mask)[0]
+            phot_map = {idx: {k: phot_valid[k][vi] for k in phot_valid}
+                        for vi, idx in enumerate(valid_indices)}
+        else:
+            phot_map = {}
 
         for j, sid in enumerate(source_ids):
+            result = phot_map.get(j, nan_result)
             records.append({
                 "source_id": int(sid),
                 "x_ref": positions[j, 0],
                 "y_ref": positions[j, 1],
                 "filename": fits_path.name,
                 "obs_time": obs_time,
-                "flux": phot["flux"][j],
-                "flux_err": phot["flux_err"][j],
-                "mag": phot["mag"][j],
-                "mag_err": phot["mag_err"][j],
-                "snr": phot["snr"][j],
-                "sky_bkg": phot["sky_bkg"][j],
+                "flux": result["flux"],
+                "flux_err": result["flux_err"],
+                "mag": result["mag"],
+                "mag_err": result["mag_err"],
+                "snr": result["snr"],
+                "sky_bkg": result["sky_bkg"],
             })
 
     df = pd.DataFrame(records)

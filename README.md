@@ -23,8 +23,9 @@ A command-line tool for aperture photometry on stacks of calibrated astronomical
 | `numpy` | Array operations |
 | `pandas` | Tabular output (CSV) |
 | `astropy` | FITS I/O, time conversion, visualisation scaling |
-| `photutils` | Source detection (`DAOStarFinder`), aperture photometry |
-| `astroalign` | Image-to-image alignment |
+| `photutils` | Source detection (`DAOStarFinder`), aperture photometry, centroiding |
+| `astroalign` | Image-to-image alignment (transform estimation) |
+| `scipy` | Integer-pixel image shifting (no interpolation) |
 | `matplotlib` | Diagnostic plots |
 
 Python **3.10+** is required (uses `X | Y` union type hints).
@@ -107,7 +108,8 @@ The default configuration is in [`config/default_config.json`](config/default_co
     "fits_extension": 0,
     "align": true,
     "coverage_min_fraction": 0.9,
-    "gain": 1.0
+    "gain": 1.0,
+    "centroid_box_radius": 5
 }
 ```
 
@@ -122,6 +124,7 @@ The default configuration is in [`config/default_config.json`](config/default_co
 | `align` | bool | Whether to align each image to the reference frame before photometry. Can be overridden on the command line with `--no-align`. |
 | `coverage_min_fraction` | float (0–1) | Minimum fraction of images in which a source must yield a valid (non-NaN) flux to be retained. E.g. `0.9` requires a source to be measurable in at least 90% of frames. |
 | `gain` | float (e⁻/ADU) | Detector gain used for Poisson noise estimation. Set to `1.0` if images are already in electrons. |
+| `centroid_box_radius` | int (pixels) | Half-width of the search box used to re-centroid each source in every aligned frame (see Step 3). Increase for undersampled PSFs or large dither residuals; decrease to avoid cross-contamination in crowded fields. |
 
 ---
 
@@ -173,13 +176,29 @@ Source detection is then carried out with **`DAOStarFinder`** (`photutils`), whi
 
 ### Step 3 — Image alignment (per-frame, optional)
 
-For each image after the reference, if `align = true`, the science frame is registered onto the reference pixel grid using **`astroalign`**. The alignment process works as follows:
+For each image after the reference, if `align = true`, the science frame is aligned onto the reference pixel grid. The process has two parts:
 
-1. Point sources are identified in both the science and reference frames.
-2. Triangles are formed from source triplets and a geometric hash is built, making the matching invariant to rotation, scale, and translation.
-3. The best-matching affine transformation is found and the science image is resampled onto the reference coordinate system.
+#### 3a — Integer-pixel shift (no interpolation)
 
-Pixels that fall **outside the overlap region** after the affine warp (e.g. sky area covered by one dither position but not another) are filled with **NaN** and tracked in a boolean `bad_mask`. Any aperture or sky annulus that overlaps even a single NaN pixel is flagged as invalid, and its photometric measurement is set to NaN for that epoch. If alignment fails entirely (insufficient matched stars), **all measurements for that image are set to NaN** and a warning is emitted to the log.
+1. Point sources are identified in both the science and reference frames by **`astroalign`**.
+2. A geometric hash of source triangles is built, making the match invariant to rotation, scale, and translation.
+3. The best-fit affine transformation is found. **Only the translation component is used**; rotation and scale differences between frames are assumed to be negligible for typical observatory dither patterns.
+4. The translation vector is **rounded to the nearest integer pixel**. The image is then shifted by that exact integer offset using `scipy.ndimage.shift` at `order=0` (nearest-neighbour mode).
+
+Because the shift is a whole number of pixels, each output pixel receives the value of exactly one input pixel — **no sub-pixel blending or interpolation is performed**. This avoids correlated noise between adjacent pixels that arises from resampling, and eliminates flux redistribution artefacts near the PSF core.
+
+Pixels that fall **outside the overlap region** after the shift (e.g. sky area covered by one dither position but not another) are filled with **NaN** and tracked in a boolean `bad_mask`. Any aperture or sky annulus that overlaps even a single NaN pixel is flagged as invalid and its photometric measurement is set to NaN for that epoch. If alignment fails entirely (insufficient matched stars), **all measurements for that image are set to NaN** and a warning is emitted to the log.
+
+#### 3b — Per-frame aperture re-centroiding
+
+Rounding the shift to an integer leaves a sub-pixel residual: sources in the shifted frame are not guaranteed to lie exactly at the reference-frame positions `(x_ref + dx, y_ref + dy)`. To account for this, each source is **re-centroided** in the shifted frame:
+
+1. The nominal expected position after the integer shift is computed for every source.
+2. A square cutout of half-width `centroid_box_radius` pixels is extracted around each expected position.
+3. A **centre-of-mass centroid** (`photutils.centroids.centroid_com`) is computed on the cutout to obtain the refined sub-pixel position.
+4. Sources whose expected position falls outside the image boundary, or where the centroid is non-finite (e.g. an entirely NaN cutout at a frame edge), are assigned NaN positions and their measurements are set to NaN for that epoch.
+
+The re-centroided positions are used **only for that individual frame**; the original reference-frame coordinates (`x_ref`, `y_ref`) are always stored in the output CSV so that sources can be identified consistently across epochs.
 
 ### Step 4 — Sky background estimation
 

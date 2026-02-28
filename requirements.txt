@@ -4,3 +4,4 @@ astroalign
 numpy
 pandas
 matplotlib
+scipy
