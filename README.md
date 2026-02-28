@@ -13,6 +13,7 @@ A command-line tool for aperture photometry on stacks of calibrated astronomical
 5. [Configuration Reference](#configuration-reference)
 6. [Output Files](#output-files)
 7. [Photometry Procedure — Detailed Description](#photometry-procedure--detailed-description)
+8. [Differential Photometry Procedure — Detailed Description](#differential-photometry-procedure--detailed-description)
 
 ---
 
@@ -76,6 +77,32 @@ python aperture_photometry.py \
     --plots
 ```
 
+### Differential photometry
+
+```bash
+# Minimal run — weighted-mean reference, no plots
+python differential_photometry.py \
+    --input demo_output/photometry.csv
+
+# With diagnostic plots and an explicit output directory
+python differential_photometry.py \
+    --input  demo_output/photometry.csv \
+    --output-dir demo_output \
+    --plots
+
+# Override the reference-star SNR threshold and construction method
+python differential_photometry.py \
+    --input demo_output/photometry.csv \
+    --method weighted_mean \
+    --min-ref-snr 15 \
+    --plots
+
+# Disable iterative sigma-clipping of reference stars
+python differential_photometry.py \
+    --input demo_output/photometry.csv \
+    --sigma-clip 0
+```
+
 ---
 
 ## Command-Line Reference
@@ -91,6 +118,23 @@ python aperture_photometry.py --input <dir> [OPTIONS]
 | `--output-dir <dir>` | No | `photometry_output` | Directory where `photometry.csv` and (optionally) plots are written. Created automatically if it does not exist. |
 | `--plots` | No | off | When set, generates diagnostic images: `reference_image_sources.png`, `snr_vs_magnitude.png`, `temporal_snr_vs_magnitude.png`, and per-source light curve PNGs under `lightcurves/`. |
 | `--no-align` | No | off | Disables image alignment. Overrides `align: true` in the config file. |
+
+### `differential_photometry.py`
+
+```
+python differential_photometry.py --input <csv> [OPTIONS]
+```
+
+| Flag | Required | Default | Description |
+|---|---|---|---|
+| `--input <csv>` | Yes | — | Path to `photometry.csv` produced by `aperture_photometry.py`. |
+| `--config <json>` | No | `config/default_config.json` | Path to a JSON configuration file. |
+| `--output-dir <dir>` | No | parent of input CSV | Directory where `differential_photometry.csv` and (optionally) plots are written. |
+| `--method <method>` | No | `weighted_mean` (from config) | Reference-curve construction method. Currently only `weighted_mean` is available. |
+| `--min-ref-snr <SNR>` | No | `10.0` (from config) | Minimum temporal SNR a star must have to qualify as a reference star. Overrides `min_reference_snr` in the config. |
+| `--sigma-clip <σ>` | No | `3.0` (from config) | Sigma threshold for iterative leave-one-out reference-star sigma-clipping. Set to `0` to disable. Overrides `sigma_clip` in the config. |
+| `--min-ref-stars <N>` | No | `3` (from config) | Minimum number of reference stars to retain during sigma-clipping. Clipping stops when the ensemble reaches this size. Overrides `min_ref_stars` in the config. |
+| `--plots` | No | off | When set, saves differential light-curve PNG plots under `differential_lightcurves/`. |
 
 ---
 
@@ -109,7 +153,11 @@ The default configuration is in [`config/default_config.json`](config/default_co
     "align": true,
     "coverage_min_fraction": 0.9,
     "gain": 1.0,
-    "centroid_box_radius": 5
+    "centroid_box_radius": 5,
+    "diff_method": "weighted_mean",
+    "min_reference_snr": 10.0,
+    "sigma_clip": 3.0,
+    "min_ref_stars": 3
 }
 ```
 
@@ -125,6 +173,10 @@ The default configuration is in [`config/default_config.json`](config/default_co
 | `coverage_min_fraction` | float (0–1) | Minimum fraction of images in which a source must yield a valid (non-NaN) flux to be retained. E.g. `0.9` requires a source to be measurable in at least 90% of frames. |
 | `gain` | float (e⁻/ADU) | Detector gain used for Poisson noise estimation. Set to `1.0` if images are already in electrons. |
 | `centroid_box_radius` | int (pixels) | Half-width of the search box used to re-centroid each source in every aligned frame (see Step 3). Increase for undersampled PSFs or large dither residuals; decrease to avoid cross-contamination in crowded fields. |
+| `diff_method` | string | Reference-curve construction method used by `differential_photometry.py`. Currently only `"weighted_mean"` is supported. |
+| `min_reference_snr` | float | Minimum temporal SNR a star must have to be included in the reference ensemble. |
+| `sigma_clip` | float | Sigma threshold for iterative leave-one-out sigma-clipping of reference stars. Set to `0` to disable. |
+| `min_ref_stars` | int | Minimum number of reference stars preserved during sigma-clipping. Clipping stops if the ensemble would fall below this count. |
 
 ---
 
@@ -157,6 +209,24 @@ One row per (source, image) pair. Columns:
 | `snr_vs_magnitude.png` | Per-epoch median SNR vs median instrumental magnitude for every surviving source. Useful for assessing photometric depth and saturation limits. |
 | `temporal_snr_vs_magnitude.png` | Temporal SNR vs median magnitude. Sources significantly above the main locus are candidate variable stars or transients. |
 | `lightcurves/source_NNNN.png` | One light-curve plot per source: sky-subtracted flux with 1-σ error bars vs observation time (or epoch index if timestamps are unavailable). |
+
+### `differential_photometry.csv`
+
+One row per (source, image) pair. All columns from `photometry.csv` are preserved; additional columns:
+
+| Column | Description |
+|---|---|
+| `ref_mag` | Weighted-mean reference magnitude at this epoch, computed from the reference ensemble (with leave-one-out correction when the target is itself a reference star). |
+| `ref_mag_err` | 1-σ uncertainty on `ref_mag` propagated from the individual reference-star magnitude errors. |
+| `diff_mag` | Differential magnitude: `(mag − median(mag)) − ref_mag`. A stable star produces `diff_mag ≈ 0` at all epochs; a variable star shows a non-zero signal. |
+| `diff_mag_err` | 1-σ uncertainty on `diff_mag`: $\sqrt{\sigma_m^2 + \sigma_{\text{ref}}^2}$. |
+| `is_reference` | Boolean — `True` if this source is a member of the reference ensemble. |
+
+### Differential photometry diagnostic plots (`--plots`)
+
+| File | Description |
+|---|---|
+| `differential_lightcurves/source_NNNN.png` | One differential light-curve plot per source: `diff_mag` with 1-σ error bars vs observation time (or epoch index). Reference stars are labelled as such in the plot title. |
 
 ---
 
@@ -262,3 +332,78 @@ The complete measurement table is written to `photometry.csv`. If `--plots` is s
 - **Per-epoch SNR vs magnitude** — identifies the photon-noise floor, bright saturation limit, and any systematic noise floor.
 - **Temporal SNR vs magnitude** — variable sources appear as outliers above the expected Poisson noise locus.
 - **Individual light curves** — one PNG per source: sky-subtracted flux with 1-σ error bars as a function of ISO observation time (if available in the FITS headers) or integer epoch index (if not).
+
+---
+
+## Differential Photometry Procedure — Detailed Description
+
+This section describes every step performed by `differential_photometry.py`. The script reads the `photometry.csv` produced by `aperture_photometry.py` and reduces the instrumental magnitude time series of each source to a **differential** (relative) light curve that is largely free of systematic trends caused by atmospheric transparency variations, flat-fielding residuals, or other epoch-correlated effects.
+
+### Step 1 — Reference-star selection (SNR filter)
+
+The first pass over the photometry table applies a **temporal SNR threshold** (`min_reference_snr`). Only sources whose `temporal_snr` — the ratio of the median to the standard deviation of the flux time series, computed in `aperture_photometry.py` — meets or exceeds the threshold are admitted to the candidate reference pool. Faint, noisy, or intrinsically variable sources are excluded at this stage because including them in the reference would corrupt the ensemble and degrade the differential correction for all targets.
+
+### Step 2 — Iterative sigma-clipping of reference stars
+
+The SNR cut provides a first approximation to a clean ensemble but cannot on its own identify stars that are marginally variable, blended, or affected by detector artefacts. A second pass uses an **iterative leave-one-out (LOO) sigma-clipping** procedure to remove remaining outliers:
+
+1. For each candidate reference star *i*, a LOO reference curve is built from the remaining ensemble (all stars except *i*).
+2. The differential residual of star *i* against its LOO curve is computed at every epoch, and the **RMS** of these residuals is recorded.
+3. A robust outlier threshold is computed from the RMS distribution:
+
+$$\text{threshold} = \text{median}(\mathrm{RMS}) + \sigma \times 1.4826 \times \mathrm{MAD}(\mathrm{RMS})$$
+
+The factor 1.4826 makes the MAD a consistent estimator of σ for Gaussian data.
+
+4. The star with the highest RMS is removed if it exceeds the threshold.
+5. Steps 1–4 repeat until no star exceeds the threshold (convergence) **or** the ensemble reaches `min_ref_stars`.
+
+A full audit log of every removal — including the star's source ID, its RMS, and the threshold at that iteration — is written to the console at `INFO` level. If `sigma_clip = 0` in the configuration (or `--sigma-clip 0` on the command line), this step is skipped entirely.
+
+### Step 3 — SNR-squared weights
+
+Each star in the final reference ensemble is assigned a **weight proportional to its squared temporal SNR**:
+
+$$w_i = \frac{\mathrm{snr}_i^2}{\displaystyle\sum_j \mathrm{snr}_j^2}$$
+
+Higher-SNR stars contribute more to the reference curve and, because the weights are squared, bright stable stars dominate over many faint ones. Weights are normalised to sum to 1 across the ensemble and are then renormalised **per epoch** to handle missing measurements (NaNs) at individual epochs gracefully, ensuring the reference is always computed from the available stars at each time step.
+
+### Step 4 — Reference-curve construction
+
+For each epoch *e* the **weighted-mean reference magnitude** is:
+
+$$m_{\text{ref}}(e) = \frac{\sum_i w_i(e)\, \delta m_i(e)}{\sum_i w_i(e)}$$
+
+where $\delta m_i(e) = m_i(e) - \mathrm{median}_t(m_i)$ is the magnitude of reference star *i* expressed as a **deviation from its own temporal median**. Subtracting each star's median before combining removes the arbitrary brightness offset between ensemble members, so the resulting reference curve captures only the **common-mode temporal variation** of the sky (atmospheric extinction, transparency fluctuations, etc.) rather than an average absolute brightness.
+
+The propagated uncertainty on the reference curve is:
+
+$$\sigma_{\text{ref}}(e) = \sqrt{\sum_i \tilde{w}_i(e)^2\, \sigma_{m,i}(e)^2}$$
+
+where $\tilde{w}_i(e)$ are the epoch-renormalised weights.
+
+### Step 5 — Leave-one-out correction for reference stars
+
+When the **target star is itself a member of the reference ensemble**, using the full reference curve would introduce a spurious self-correlation: any variation in the target would appear in both the target light curve and the reference, causing the differential signal to be suppressed. This is avoided by applying a **leave-one-out (LOO) correction**: the reference curve used for target *t* has star *t*'s contribution analytically removed without rebuilding the ensemble from scratch:
+
+$$m_{\text{ref,loo}}^{(t)}(e) = \frac{W(e)\, m_{\text{ref}}(e) - w_t(e)\, \delta m_t(e)}{W(e) - w_t(e)}$$
+
+where $W(e) = \sum_j w_j(e)$ is the total effective weight at epoch *e*. If removing star *t* would leave the ensemble empty at a given epoch ($W(e) - w_t(e) = 0$), that epoch is assigned a NaN reference magnitude. Targets that are **not** in the reference pool receive the full (un-modified) reference curve unchanged.
+
+### Step 6 — Differential light curve computation
+
+For every source *t* and epoch *e*, the differential magnitude is:
+
+$$\Delta m_t(e) = \bigl(m_t(e) - \mathrm{median}_e(m_t)\bigr) - m_{\text{ref,loo}}^{(t)}(e)$$
+
+Subtracting the target's own temporal median places it in the same "deviation from mean" space as the reference curve (which was built from per-star medians in Step 4). For a **perfectly stable star**, $\Delta m_t(e) \approx 0$ at all epochs. For a **variable source**, $\Delta m_t(e)$ will show the intrinsic brightness changes after the common-mode atmospheric systematics have been removed.
+
+The uncertainty is quadrature-summed from the per-epoch photometric error and the reference-curve error:
+
+$$\sigma_{\Delta m}(e) = \sqrt{\sigma_{m_t}(e)^2 + \sigma_{\text{ref}}(e)^2}$$
+
+Epochs where either $m_t$ or $m_{\text{ref}}$ is NaN are set to NaN in both `diff_mag` and `diff_mag_err`.
+
+### Step 7 — Output
+
+The differential photometry table is written to `differential_photometry.csv`. It contains all columns from the input `photometry.csv` plus `ref_mag`, `ref_mag_err`, `diff_mag`, `diff_mag_err`, and `is_reference`. If `--plots` is specified, one PNG per source is saved under `differential_lightcurves/`: each plot shows `diff_mag` with 1-σ error bars as a function of observation time (or epoch index if timestamps are unavailable), with reference stars labelled in the plot title.
