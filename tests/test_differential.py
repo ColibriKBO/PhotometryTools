@@ -12,10 +12,13 @@ import pytest
 
 from src.differential import (
     REFERENCE_METHODS,
+    _compute_loo_rms,
+    _build_ref_matrices,
     build_weighted_mean_reference,
     compute_differential_lightcurves,
     compute_snr_weights,
     select_reference_stars,
+    sigma_clip_reference_stars,
 )
 
 
@@ -342,3 +345,192 @@ class TestComputeDifferentialLightcurves:
     def test_reference_methods_registry_contains_weighted_mean(self):
         assert "weighted_mean" in REFERENCE_METHODS
         assert callable(REFERENCE_METHODS["weighted_mean"])
+
+
+# ---------------------------------------------------------------------------
+# Helpers for sigma-clipping tests
+# ---------------------------------------------------------------------------
+
+def make_photometry_with_outlier(
+    n_stable: int = 4,
+    n_epochs: int = 20,
+    stable_scatter: float = 0.01,
+    outlier_scatter: float = 0.5,
+    snr: float = 50.0,
+    seed: int = 99,
+) -> tuple[pd.DataFrame, int]:
+    """Return a photometry DataFrame with *n_stable* quiet stars and one
+    obviously noisy outlier.  The outlier source_id is returned as the second
+    element of the tuple.
+    """
+    rng = np.random.default_rng(seed)
+    filenames = [f"img_{e:04d}.fits" for e in range(n_epochs)]
+    obs_times = [f"2025-01-01T{e:02d}:00:00" for e in range(n_epochs)]
+
+    records = []
+    all_sids = list(range(n_stable + 1))
+    outlier_sid = n_stable  # last source
+
+    for sid in all_sids:
+        base = 10.0 + sid * 1.5
+        scatter = outlier_scatter if sid == outlier_sid else stable_scatter
+        for e in range(n_epochs):
+            mag = base + rng.normal(0.0, scatter)
+            records.append(
+                {
+                    "source_id": sid,
+                    "x_ref": float(30 + sid * 15),
+                    "y_ref": float(30 + sid * 15),
+                    "filename": filenames[e],
+                    "obs_time": obs_times[e],
+                    "flux": 10 ** (-mag / 2.5),
+                    "flux_err": 0.001,
+                    "mag": mag,
+                    "mag_err": 0.01,
+                    "snr": snr,
+                    "sky_bkg": 1.0,
+                    "temporal_snr": snr,
+                }
+            )
+
+    return pd.DataFrame(records), outlier_sid
+
+
+# ---------------------------------------------------------------------------
+# TestComputeLooRms
+# ---------------------------------------------------------------------------
+
+
+class TestComputeLooRms:
+    def test_returns_array_of_correct_length(self):
+        df = make_photometry_df(n_sources=4, n_epochs=8)
+        mats = _build_ref_matrices(df, reference_ids=[0, 1, 2, 3])
+        rms = _compute_loo_rms(mats)
+        assert rms.shape == (4,)
+
+    def test_constant_stars_have_near_zero_rms(self):
+        """Perfectly constant stars should yield RMS ≈ 0."""
+        df = make_photometry_df(n_sources=3, n_epochs=10, temporal_snrs=[20.0]*3)
+        df.loc[df["source_id"] == 0, "mag"] = 10.0
+        df.loc[df["source_id"] == 1, "mag"] = 12.0
+        df.loc[df["source_id"] == 2, "mag"] = 14.0
+        mats = _build_ref_matrices(df, [0, 1, 2])
+        rms = _compute_loo_rms(mats)
+        np.testing.assert_allclose(rms, 0.0, atol=1e-6)
+
+    def test_noisy_star_has_higher_rms(self):
+        """The outlier star should get a noticeably larger LOO RMS.
+
+        With n_stable=5 equal-weight stars plus one noisy outlier the
+        outlier's LOO RMS ≈ scatter_outlier * sqrt(5/6) ≈ 0.46, while each
+        stable star's LOO RMS ≈ scatter_outlier/6 * sqrt(6/5) ≈ 0.09.
+        The ratio of ~5 is well above the 3× guard used here.
+        """
+        df, outlier_sid = make_photometry_with_outlier(n_stable=5, n_epochs=40)
+        all_ids = list(range(6))
+        mats = _build_ref_matrices(df, all_ids)
+        rms = _compute_loo_rms(mats)
+        col_order = mats["col_order"]
+        outlier_idx = col_order.index(outlier_sid)
+        stable_rms = [rms[i] for i in range(len(col_order)) if i != outlier_idx]
+        assert rms[outlier_idx] > 3 * max(stable_rms), (
+            "Outlier RMS should be >3× the max stable-star RMS"
+        )
+
+    def test_nan_for_star_with_too_few_epochs(self):
+        """A star present in fewer than 2 epochs should yield NaN RMS."""
+        df = make_photometry_df(n_sources=3, n_epochs=5)
+        # Give source 2 only one valid epoch
+        src2_epochs = df[df["source_id"] == 2]["filename"].tolist()
+        mask = (df["source_id"] == 2) & (df["filename"].isin(src2_epochs[1:]))
+        df.loc[mask, "mag"] = np.nan
+        mats = _build_ref_matrices(df, [0, 1, 2])
+        rms = _compute_loo_rms(mats)
+        idx2 = mats["col_order"].index(2)
+        assert np.isnan(rms[idx2])
+
+
+# ---------------------------------------------------------------------------
+# TestSigmaClipReferenceStars
+# ---------------------------------------------------------------------------
+
+
+class TestSigmaClipReferenceStars:
+    def test_returns_sorted_list(self):
+        df = make_photometry_df(n_sources=4, n_epochs=15)
+        ids = sigma_clip_reference_stars(df, [0, 1, 2, 3])
+        assert ids == sorted(ids)
+
+    def test_clean_ensemble_unchanged(self):
+        """Four equally-stable stars — nothing should be removed."""
+        df = make_photometry_df(
+            n_sources=4, n_epochs=20, temporal_snrs=[50.0] * 4, seed=7
+        )
+        for sid in range(4):
+            df.loc[df["source_id"] == sid, "mag"] = 10.0 + sid
+        retained = sigma_clip_reference_stars(df, [0, 1, 2, 3], sigma=3.0)
+        assert set(retained) == {0, 1, 2, 3}
+
+    def test_outlier_star_is_removed(self):
+        """One very noisy star should be clipped from the ensemble."""
+        df, outlier_sid = make_photometry_with_outlier(
+            n_stable=4, n_epochs=30, seed=42
+        )
+        all_ids = list(range(5))
+        retained = sigma_clip_reference_stars(
+            df, all_ids, sigma=3.0, min_ref_stars=3
+        )
+        assert outlier_sid not in retained
+        # Stable stars should all survive
+        assert all(sid in retained for sid in range(4))
+
+    def test_min_ref_stars_respected(self):
+        """Clipping should halt once the ensemble reaches min_ref_stars."""
+        # All stars are equally noisy so the algorithm would clip forever
+        # without the guard.
+        df, _ = make_photometry_with_outlier(
+            n_stable=2, n_epochs=20, outlier_scatter=0.5, seed=11
+        )
+        all_ids = [0, 1, 2]
+        retained = sigma_clip_reference_stars(
+            df, all_ids, sigma=0.01, min_ref_stars=3
+        )
+        # sigma=0.01 is extremely tight, but min_ref_stars=3 should prevent
+        # removing anything since we start with exactly 3 stars.
+        assert len(retained) == 3
+
+    def test_raises_on_empty_candidates(self):
+        df = make_photometry_df(n_sources=2, n_epochs=5)
+        with pytest.raises(ValueError, match="empty"):
+            sigma_clip_reference_stars(df, [])
+
+    def test_single_sigma_converges(self):
+        """With a single sigma value the algorithm must still converge."""
+        df, outlier_sid = make_photometry_with_outlier(
+            n_stable=3, n_epochs=25, seed=55
+        )
+        all_ids = list(range(4))
+        retained = sigma_clip_reference_stars(
+            df, all_ids, sigma=3.0, min_ref_stars=2
+        )
+        assert isinstance(retained, list)
+        assert len(retained) >= 2
+
+    def test_does_not_use_target_in_its_own_reference(self):
+        """The LOO property: a constant star's diff_mag through the
+        sigma-clipped ensemble must still be 0 (star excluded from its own
+        reference)."""
+        df = make_photometry_df(
+            n_sources=3, n_epochs=10, temporal_snrs=[30.0] * 3, seed=0
+        )
+        for sid in range(3):
+            df.loc[df["source_id"] == sid, "mag"] = 10.0 + sid * 2.0
+
+        retained = sigma_clip_reference_stars(df, [0, 1, 2], sigma=3.0)
+        diff = compute_differential_lightcurves(df, retained)
+        for sid in retained:
+            src = diff[diff["source_id"] == sid]
+            np.testing.assert_allclose(
+                src["diff_mag"].dropna().values, 0.0, atol=1e-5,
+                err_msg=f"source_{sid}: constant star should have diff_mag≈0"
+            )

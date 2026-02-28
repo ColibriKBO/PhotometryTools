@@ -303,6 +303,25 @@ def plot_differential_lightcurves(df: pd.DataFrame, output_dir: Path) -> None:
         half_range = max(4.0 * mad, 0.05)
         ax.set_ylim(med - half_range * 1.5, med + half_range * 1.5)
 
+        # Secondary y-axis: relative flux differential  δF/F = 10^(−Δm/2.5) − 1
+        # forward : Δm  → δF/F
+        # inverse : δF/F → Δm
+        def _mag_to_relflux(dm):
+            return np.power(10.0, -np.asarray(dm) / 2.5) - 1.0
+
+        def _relflux_to_mag(f):
+            # Protect against log of zero/negative
+            fv = np.asarray(f)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                return -2.5 * np.log10(np.where(fv > -1.0, 1.0 + fv, np.nan))
+
+        ax2 = ax.secondary_yaxis("right", functions=(_mag_to_relflux, _relflux_to_mag))
+        ax2.set_ylabel("Relative Flux Differential  (δF/F)", fontsize=12)
+        # Format secondary ticks as percentages for readability
+        ax2.yaxis.set_major_formatter(
+            plt.FuncFormatter(lambda v, _: f"{v * 100:.2g}%")
+        )
+
         if use_datetime:
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M"))
             fig.autofmt_xdate(rotation=30, ha="right")

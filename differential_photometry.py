@@ -32,6 +32,7 @@ from src.differential import (
     REFERENCE_METHODS,
     compute_differential_lightcurves,
     select_reference_stars,
+    sigma_clip_reference_stars,
 )
 from src.plots import plot_differential_lightcurves
 
@@ -95,6 +96,27 @@ def parse_args(argv=None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--sigma-clip",
+        type=float,
+        default=None,
+        metavar="SIGMA",
+        help=(
+            "Conservative sigma threshold for iterative reference-star "
+            "sigma-clipping (phase 1).  Overrides config.  Set to 0 to "
+            "disable sigma-clipping entirely."
+        ),
+    )
+    parser.add_argument(
+        "--min-ref-stars",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Minimum number of reference stars to keep during sigma-clipping. "
+            "Overrides config."
+        ),
+    )
+    parser.add_argument(
         "--plots",
         action="store_true",
         help="Save differential light curve PNG plots.",
@@ -114,9 +136,15 @@ def main(argv=None) -> None:
         cfg["diff_method"] = args.method
     if args.min_ref_snr is not None:
         cfg["min_reference_snr"] = args.min_ref_snr
+    if args.sigma_clip is not None:
+        cfg["sigma_clip"] = args.sigma_clip
+    if args.min_ref_stars is not None:
+        cfg["min_ref_stars"] = args.min_ref_stars
 
     method = cfg.get("diff_method", "weighted_mean")
     min_ref_snr = float(cfg.get("min_reference_snr", 10.0))
+    sigma_clip = cfg.get("sigma_clip", 3.0)
+    min_ref_stars = int(cfg.get("min_ref_stars", 3))
 
     log.info(f"Method: {method}  |  Min reference SNR: {min_ref_snr}")
 
@@ -149,13 +177,32 @@ def main(argv=None) -> None:
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # Select reference stars
+    # Select reference stars (initial SNR filter + iterative sigma-clip)
     # ------------------------------------------------------------------
     try:
         reference_ids = select_reference_stars(df, min_temporal_snr=min_ref_snr)
     except ValueError as exc:
         log.error(str(exc))
         sys.exit(1)
+
+    sigma_clip_enabled = isinstance(sigma_clip, (int, float)) and float(sigma_clip) > 0
+    if sigma_clip_enabled:
+        log.info(
+            f"Applying iterative sigma-clipping to {len(reference_ids)} candidate "
+            f"reference stars (sigma={sigma_clip}, min_stars={min_ref_stars})."
+        )
+        try:
+            reference_ids = sigma_clip_reference_stars(
+                df,
+                reference_ids,
+                sigma=float(sigma_clip),
+                min_ref_stars=min_ref_stars,
+            )
+        except ValueError as exc:
+            log.error(str(exc))
+            sys.exit(1)
+    else:
+        log.info("Sigma-clipping disabled (sigma_clip=0 or not set).")
 
     # ------------------------------------------------------------------
     # Compute differential light curves

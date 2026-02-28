@@ -224,6 +224,214 @@ def _build_ref_matrices(
 
 
 # ---------------------------------------------------------------------------
+# Leave-one-out RMS helper
+# ---------------------------------------------------------------------------
+
+
+def _compute_loo_rms(mats: dict) -> np.ndarray:
+    """Compute the leave-one-out differential RMS for each reference star.
+
+    For each star *i* currently in the ensemble the function:
+
+    1. Rebuilds the reference curve **without** star *i* (LOO).
+    2. Computes ``diff_i(e) = mag_i(e) - ref_{-i}(e)`` for every valid epoch.
+    3. Returns ``RMS_i = sqrt(mean(diff_i²))``.
+
+    Parameters
+    ----------
+    mats : dict
+        Output of :func:`_build_ref_matrices` for the current ensemble.
+
+    Returns
+    -------
+    np.ndarray
+        Shape ``(n_refs,)``.  ``NaN`` for stars with fewer than 2 valid epochs
+        or whose removal empties the ensemble at all epochs.
+    """
+    n_refs = len(mats["col_order"])
+    rms = np.full(n_refs, np.nan)
+
+    ref_mag_safe = np.where(np.isfinite(mats["ref_mag"]), mats["ref_mag"], 0.0)
+
+    for i in range(n_refs):
+        w_i = mats["w_eff"][:, i]           # (n_epochs,) effective weight
+        valid_i = w_i > 0                    # epochs where star i has a measurement
+
+        if valid_i.sum() < 2:
+            continue
+
+        W_loo = mats["W_sum"] - w_i          # (n_epochs,)
+        safe_W_loo = np.where(W_loo > 0, W_loo, np.nan)
+
+        # LOO reference: remove star i's contribution from the full sum
+        loo_mag = (
+            mats["W_sum"] * ref_mag_safe
+            - w_i * mats["mag_filled"][:, i]
+        ) / safe_W_loo
+        loo_mag[W_loo == 0] = np.nan
+
+        # Differential at valid epochs only
+        diff = mats["mag_filled"][:, i] - loo_mag
+        mask = valid_i & np.isfinite(loo_mag)
+        diff_valid = diff[mask]
+
+        if len(diff_valid) < 2:
+            continue
+
+        rms[i] = np.sqrt(np.mean(diff_valid ** 2))
+
+    return rms
+
+
+# ---------------------------------------------------------------------------
+# Iterative sigma-clipping reference star selection
+# ---------------------------------------------------------------------------
+
+
+def sigma_clip_reference_stars(
+    df: pd.DataFrame,
+    candidate_ids: list[int],
+    sigma: float = 3.0,
+    min_ref_stars: int = 3,
+) -> list[int]:
+    """Iteratively sigma-clip reference stars by their leave-one-out RMS.
+
+    Starting from *candidate_ids* the algorithm removes one star per
+    iteration — the worst offender — and repeats until the ensemble is
+    clean (no star exceeds the threshold) or the minimum size is reached.
+
+    Algorithm per iteration
+    -----------------------
+    1. Build LOO reference matrices for the current ensemble.
+    2. Compute per-star leave-one-out differential RMS via
+       :func:`_compute_loo_rms`.
+    3. Compute a robust threshold::
+
+           threshold = median(RMS) + sigma * 1.4826 * MAD(RMS)
+
+       The 1.4826 factor makes MAD a consistent estimator of σ for Gaussian
+       data.
+    4. Remove the star with the highest RMS if it exceeds the threshold.
+    5. Repeat until no star exceeds the threshold (convergence).
+
+    A full clip log is emitted at ``INFO`` level on completion.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Full photometry table — the same DataFrame passed to
+        :func:`compute_differential_lightcurves`.
+    candidate_ids : list[int]
+        Initial set of candidate reference star IDs (e.g. from
+        :func:`select_reference_stars`).
+    sigma : float
+        Sigma threshold used throughout clipping.  Default ``3.0``.
+    min_ref_stars : int
+        Minimum number of reference stars to keep.  Clipping stops when
+        the ensemble reaches this size.  Default ``3``.
+
+    Returns
+    -------
+    list[int]
+        Sorted list of retained reference star IDs.
+
+    Raises
+    ------
+    ValueError
+        If *candidate_ids* is empty.
+    """
+    if not candidate_ids:
+        raise ValueError("candidate_ids is empty — no reference stars to clip.")
+
+    current_ids = list(candidate_ids)
+    clipped_log: list[dict] = []
+
+    log.info(
+        f"Sigma-clip: threshold={sigma}σ, "
+        f"starting ensemble size={len(current_ids)}."
+    )
+    iteration = 0
+
+    while True:
+        if len(current_ids) <= min_ref_stars:
+            log.warning(
+                f"Ensemble has reached the minimum size of {min_ref_stars} "
+                f"stars; stopping sigma-clipping."
+            )
+            break
+
+        mats = _build_ref_matrices(df, current_ids)
+        rms_arr = _compute_loo_rms(mats)
+        col_order = mats["col_order"]
+
+        valid_rms = rms_arr[np.isfinite(rms_arr)]
+        if len(valid_rms) < 2:
+            log.debug("Fewer than 2 stars with valid RMS — stopping.")
+            break
+
+        median_rms = float(np.median(valid_rms))
+        mad_rms = float(np.median(np.abs(valid_rms - median_rms)))
+        threshold = median_rms + sigma * 1.4826 * mad_rms
+
+        worst_idx = int(np.nanargmax(rms_arr))
+        worst_rms = float(rms_arr[worst_idx])
+        worst_id = col_order[worst_idx]
+
+        iteration += 1
+        log.debug(
+            f"  Iter {iteration}: median_RMS={median_rms:.5f}, "
+            f"MAD={mad_rms:.5f}, threshold={threshold:.5f}, "
+            f"worst=source_{worst_id} RMS={worst_rms:.5f}"
+        )
+
+        if worst_rms > threshold:
+            current_ids.remove(worst_id)
+            entry = {
+                "source_id": worst_id,
+                "rms": worst_rms,
+                "threshold": threshold,
+                "median_rms": median_rms,
+                "mad_rms": mad_rms,
+                "iteration": iteration,
+            }
+            clipped_log.append(entry)
+            log.info(
+                f"  [iter {iteration}] Clipped source_{worst_id}: "
+                f"RMS={worst_rms:.5f} > threshold={threshold:.5f} "
+                f"({sigma}σ).  {len(current_ids)} stars remain."
+            )
+        else:
+            log.info(
+                f"  Converged after {iteration - 1} removal(s); "
+                f"no star exceeds {sigma}σ."
+            )
+            break
+
+    # ---- Summary --------------------------------------------------------
+    if clipped_log:
+        log.info(
+            f"Sigma-clip summary: removed {len(clipped_log)} star(s) from "
+            f"the initial {len(candidate_ids)}-star ensemble:"
+        )
+        for e in clipped_log:
+            log.info(
+                f"  source_{e['source_id']:>6d}: RMS={e['rms']:.5f}, "
+                f"threshold={e['threshold']:.5f} "
+                f"({sigma}σ, iter {e['iteration']})"
+            )
+    else:
+        log.info(
+            "Sigma-clip summary: ensemble already clean — no stars removed."
+        )
+
+    log.info(
+        f"Final reference ensemble after sigma-clipping: "
+        f"{len(current_ids)}/{len(candidate_ids)} stars retained."
+    )
+    return sorted(current_ids)
+
+
+# ---------------------------------------------------------------------------
 # Strategy: weighted-mean reference curve
 # ---------------------------------------------------------------------------
 
