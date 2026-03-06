@@ -1,5 +1,5 @@
 {
-    "aperture_radius": 5.0,
+    "aperture_radius": 4.0,
     "annulus_r_in": 10.0,
     "annulus_r_out": 19.0,
     "detection_fwhm": 3.0,
@@ -8,12 +8,12 @@
     "align": true,
     "coverage_min_fraction": 0.9,
     "gain": 1.0,
-    "centroid_box_radius": 4.0,
-    "edge_crop": 400,
+    "centroid_box_radius": 2.0,
+    "edge_crop": 500,
     "align_mode": "affine",
     "temporal_snr_window": 20,
     "diff_method": "weighted_mean",
-    "min_reference_snr": 0.0,
+    "min_reference_snr": 10.0,
     "sigma_clip": 3.0,
     "min_ref_stars": 3
 }
