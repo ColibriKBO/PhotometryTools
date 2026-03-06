@@ -2,12 +2,13 @@
 Image alignment utilities.
 
 Alignment is performed via astroalign to find the best-fit affine transform
-between two images.  Only the translation component is retained; it is
-rounded to the nearest whole pixel and applied with scipy.ndimage.shift at
-order=0 (nearest-neighbour), ensuring no pixel blending occurs.
+between two images.  The full transform (translation, rotation, and scale) is
+applied with skimage.transform.warp at order=0 (nearest-neighbour), so each
+output pixel receives the value of exactly one input pixel — no blending
+occurs and pixel values are conserved.
 
 After alignment, recentroid_positions refines source centroids within the
-shifted image to correct for the sub-pixel rounding residual.
+warped image using a centre-of-mass fit within a small search box.
 """
 
 import logging
@@ -21,44 +22,46 @@ def align_image(
     source: np.ndarray,
     target: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, tuple[int, int]] | tuple[None, None, None]:
-    """Align *source* onto *target* using an integer-pixel shift.
+    """Align *source* onto *target* using the full affine transform.
 
-    ``astroalign`` determines the best-fit affine transform; only the
-    translation component is kept, rounded to the nearest whole pixel, and
-    applied with ``scipy.ndimage.shift`` at ``order=0`` (nearest-neighbour).
-    Because the shift is an exact integer, each output pixel receives the
-    value of exactly one input pixel — no blending occurs.
+    ``astroalign`` determines the best-fit affine transform (translation,
+    rotation, and scale).  The full transform is applied with
+    ``skimage.transform.warp`` at ``order=0`` (nearest-neighbour), so each
+    output pixel receives the value of exactly one input pixel — no blending
+    occurs and pixel values are conserved.  This correctly handles
+    frame-to-frame rotation and scale changes that a pure translation cannot,
+    reducing residual misalignment at image edges.
 
     Returns
     -------
-    shifted : ndarray
-        Source image shifted onto the target frame.  Border pixels with no
+    warped : ndarray
+        Source image warped onto the target frame.  Border pixels with no
         source data are filled with NaN.
     bad_mask : ndarray of bool
-        True where shifted pixels are NaN (no coverage).  Apertures that
+        True where warped pixels are NaN (no coverage).  Apertures that
         overlap any True pixel will be set to NaN in ``measure_photometry``.
     shift_xy : tuple[int, int]
-        The ``(dx, dy)`` integer pixel shift applied (column, row order).
+        The integer translation component ``(dx, dy)`` of the transform
+        (column, row order), kept for API compatibility.
     Returns ``(None, None, None)`` on failure.
     """
     try:
         import astroalign as aa
-        from scipy.ndimage import shift as ndi_shift
+        from skimage.transform import warp as skwarp
 
         transform, _ = aa.find_transform(source, target)
-        tx, ty = transform.translation
-        dx = int(round(tx))
-        dy = int(round(ty))
 
-        shifted = ndi_shift(
+        warped = skwarp(
             source.astype(np.float64),
-            shift=(dy, dx),
+            inverse_map=transform.inverse,
             order=0,
             mode="constant",
             cval=np.nan,
+            preserve_range=True,
         )
-        bad_mask = ~np.isfinite(shifted)
-        return shifted, bad_mask, (dx, dy)
+        bad_mask = ~np.isfinite(warped)
+        tx, ty = transform.translation
+        return warped, bad_mask, (int(round(tx)), int(round(ty)))
     except Exception as e:
         log.warning(f"Alignment failed: {e}. Photometry for this image will be NaN.")
         return None, None, None

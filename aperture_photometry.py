@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from astropy.io import fits
 
 from src.io import load_config, read_fits, read_fits_datetime
 from src.detection import detect_sources
@@ -66,6 +67,10 @@ def main():
 
     centroid_box_radius = int(cfg.get("centroid_box_radius", 5))
 
+    # Incremental mean-stack accumulators (memory-efficient: one image at a time)
+    stack_sum: np.ndarray | None = None
+    stack_count: np.ndarray | None = None
+
     # Photometry loop
     records = []
     for i, fits_path in enumerate(fits_files):
@@ -98,9 +103,18 @@ def main():
             n_lost = int(np.sum(~np.all(np.isfinite(frame_positions), axis=1)))
             if n_lost:
                 log.debug(
-                    f"  {n_lost} source(s) outside image after shift "
-                    f"(dx={shift_xy[0]}, dy={shift_xy[1]}) — set to NaN."
+                    f"  {n_lost} source(s) outside image after alignment "
+                    f"(translation dx={shift_xy[0]}, dy={shift_xy[1]}) — set to NaN."
                 )
+
+        # Accumulate into mean stack (NaN-aware, no extra image copies in memory)
+        finite_mask = np.isfinite(data)
+        if stack_sum is None:
+            stack_sum = np.where(finite_mask, data, 0.0)
+            stack_count = finite_mask.astype(np.int32)
+        else:
+            stack_sum += np.where(finite_mask, data, 0.0)
+            stack_count += finite_mask.astype(np.int32)
 
         # Separate valid and invalid (NaN) positions before calling photutils.
         valid_mask = np.all(np.isfinite(frame_positions), axis=1)
@@ -155,6 +169,18 @@ def main():
         f"Wrote {len(df)} rows ({df['source_id'].nunique()} sources × "
         f"{df['filename'].nunique()} images) → {csv_path}"
     )
+
+    # Mean-stacked image
+    if stack_sum is not None:
+        stack_mean = np.where(stack_count > 0, stack_sum / stack_count, np.nan)
+
+        fits_stack_path = output_dir / "stacked_mean.fits"
+        hdu = fits.PrimaryHDU(stack_mean.astype(np.float32))
+        hdu.header["COMMENT"] = "Mean stack of aligned science images"
+        hdu.writeto(fits_stack_path, overwrite=True)
+        log.info(f"Saved mean-stacked FITS → {fits_stack_path}")
+
+        plots.plot_stacked_image(stack_mean, output_dir / "stacked_mean.png")
 
     # Optional diagnostic plots (post-filter)
     if args.plots:
