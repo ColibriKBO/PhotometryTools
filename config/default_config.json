@@ -10,7 +10,7 @@
     "gain": 1.0,
     "centroid_box_radius": 5,
     "diff_method": "weighted_mean",
-    "min_reference_snr": 10.0,
+    "min_reference_snr": 5.0,
     "sigma_clip": 3.0,
     "min_ref_stars": 3
 }
