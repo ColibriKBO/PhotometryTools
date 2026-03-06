@@ -1,14 +1,16 @@
 """
 Image alignment utilities.
 
-Alignment is performed via astroalign to find the best-fit affine transform
-between two images.  The full transform (translation, rotation, and scale) is
-applied with skimage.transform.warp at order=0 (nearest-neighbour), so each
-output pixel receives the value of exactly one input pixel — no blending
-occurs and pixel values are conserved.
+Two alignment modes are supported, both using astroalign to find the transform
+and order=0 (nearest-neighbour) application so no pixel blending occurs:
+
+  "affine"      — full transform (translation + rotation + scale), applied
+                  with skimage.transform.warp.  Best accuracy at image edges.
+  "translation" — integer-pixel shift only, applied with scipy.ndimage.shift.
+                  Faster; accurate when frames are well-registered already.
 
 After alignment, recentroid_positions refines source centroids within the
-warped image using a centre-of-mass fit within a small search box.
+aligned image using a centre-of-mass fit within a small search box.
 """
 
 import logging
@@ -21,47 +23,63 @@ log = logging.getLogger(__name__)
 def align_image(
     source: np.ndarray,
     target: np.ndarray,
+    full_affine: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, tuple[int, int]] | tuple[None, None, None]:
-    """Align *source* onto *target* using the full affine transform.
+    """Align *source* onto *target* using order=0 (nearest-neighbour) mapping.
 
-    ``astroalign`` determines the best-fit affine transform (translation,
-    rotation, and scale).  The full transform is applied with
-    ``skimage.transform.warp`` at ``order=0`` (nearest-neighbour), so each
-    output pixel receives the value of exactly one input pixel — no blending
-    occurs and pixel values are conserved.  This correctly handles
-    frame-to-frame rotation and scale changes that a pure translation cannot,
-    reducing residual misalignment at image edges.
+    ``astroalign`` finds the best-fit affine transform in both modes.
+
+    Parameters
+    ----------
+    full_affine : bool
+        If ``True`` (default), apply the full transform (translation, rotation,
+        and scale) with ``skimage.transform.warp``.  Best accuracy at image
+        edges.
+        If ``False``, extract only the translation component, round to the
+        nearest integer pixel, and apply with ``scipy.ndimage.shift``.  Faster,
+        but residual rotation/scale errors remain at the edges.
 
     Returns
     -------
-    warped : ndarray
-        Source image warped onto the target frame.  Border pixels with no
+    aligned : ndarray
+        Source image aligned onto the target frame.  Border pixels with no
         source data are filled with NaN.
     bad_mask : ndarray of bool
-        True where warped pixels are NaN (no coverage).  Apertures that
+        True where aligned pixels are NaN (no coverage).  Apertures that
         overlap any True pixel will be set to NaN in ``measure_photometry``.
     shift_xy : tuple[int, int]
-        The integer translation component ``(dx, dy)`` of the transform
-        (column, row order), kept for API compatibility.
+        The integer translation component ``(dx, dy)`` (column, row order).
     Returns ``(None, None, None)`` on failure.
     """
     try:
         import astroalign as aa
-        from skimage.transform import warp as skwarp
 
         transform, _ = aa.find_transform(source, target)
-
-        warped = skwarp(
-            source.astype(np.float64),
-            inverse_map=transform.inverse,
-            order=0,
-            mode="constant",
-            cval=np.nan,
-            preserve_range=True,
-        )
-        bad_mask = ~np.isfinite(warped)
         tx, ty = transform.translation
-        return warped, bad_mask, (int(round(tx)), int(round(ty)))
+        dx, dy = int(round(tx)), int(round(ty))
+
+        if full_affine:
+            from skimage.transform import warp as skwarp
+            aligned = skwarp(
+                source.astype(np.float64),
+                inverse_map=transform.inverse,
+                order=0,
+                mode="constant",
+                cval=np.nan,
+                preserve_range=True,
+            )
+        else:
+            from scipy.ndimage import shift as ndi_shift
+            aligned = ndi_shift(
+                source.astype(np.float64),
+                shift=(dy, dx),
+                order=0,
+                mode="constant",
+                cval=np.nan,
+            )
+
+        bad_mask = ~np.isfinite(aligned)
+        return aligned, bad_mask, (dx, dy)
     except Exception as e:
         log.warning(f"Alignment failed: {e}. Photometry for this image will be NaN.")
         return None, None, None

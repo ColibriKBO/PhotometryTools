@@ -47,33 +47,53 @@ def apply_coverage_filter(df: pd.DataFrame, min_fraction: float) -> pd.DataFrame
     return df
 
 
-def compute_temporal_snr(df: pd.DataFrame) -> pd.DataFrame:
+def compute_temporal_snr(df: pd.DataFrame, window: int = 0) -> pd.DataFrame:
     """Compute a temporal SNR for each source and merge it into the table.
 
     Temporal SNR is defined as::
 
         temporal_snr = median(flux) / std(flux)
 
-    across all valid (finite-flux) epochs for a source.  The result is added
-    as a new column ``temporal_snr`` so it is available in the output CSV and
-    can be used by downstream steps such as variable-star selection.
-
     Parameters
     ----------
     df : DataFrame
-        Photometry table with columns ``source_id`` and ``flux``.
+        Photometry table with columns ``source_id``, ``obs_time``, and
+        ``flux``.  Rows must already be sorted or will be sorted by
+        ``obs_time`` (then ``source_id``) internally.
+    window : int
+        Rolling-window size (number of frames).
+        ``0`` (default) — compute over all available epochs for each source
+        (original behaviour).
+        ``N > 0`` — compute a rolling median/std over *N* consecutive frames
+        per source; edge frames with fewer than *N* neighbours use whatever
+        data are available (``min_periods=1``).
 
     Returns
     -------
     DataFrame
         Copy of *df* with an additional ``temporal_snr`` column.
     """
-    stats = (
-        df.dropna(subset=["flux"])
-        .groupby("source_id")["flux"]
-        .agg(flux_median="median", flux_std="std")
-    )
-    with np.errstate(invalid="ignore", divide="ignore"):
-        stats["temporal_snr"] = stats["flux_median"] / stats["flux_std"]
-    df = df.merge(stats[["temporal_snr"]], on="source_id", how="left")
+    if window == 0:
+        # Global SNR over the full time series
+        stats = (
+            df.dropna(subset=["flux"])
+            .groupby("source_id")["flux"]
+            .agg(flux_median="median", flux_std="std")
+        )
+        with np.errstate(invalid="ignore", divide="ignore"):
+            stats["temporal_snr"] = stats["flux_median"] / stats["flux_std"]
+        df = df.merge(stats[["temporal_snr"]], on="source_id", how="left")
+    else:
+        # Rolling SNR: one value per (source, frame)
+        df = df.sort_values(["source_id", "obs_time"]).copy()
+        def _rolling_snr(grp: pd.Series) -> pd.Series:
+            roll = grp.rolling(window=window, min_periods=1, center=True)
+            med = roll.median()
+            std = roll.std()
+            with np.errstate(invalid="ignore", divide="ignore"):
+                return med / std
+        df["temporal_snr"] = (
+            df.groupby("source_id")["flux"].transform(_rolling_snr)
+        )
+        log.info(f"Temporal SNR computed with rolling window of {window} frames.")
     return df

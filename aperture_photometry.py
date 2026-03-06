@@ -3,7 +3,7 @@
 Simple aperture photometry on a stack of calibrated FITS images.
 
 Usage:
-    python aperture_photometry.py --input <dir> [--config <json>] [--output-dir <dir>] [--plots] [--no-align]
+    python aperture_photometry.py --input <dir> [--config <json>] [--output-dir <dir>] [--plots] [--no-align] [--crop <pixels>] [--align-mode affine|translation]
 """
 
 import argparse
@@ -40,11 +40,23 @@ def main():
     parser.add_argument("--output-dir", default="photometry_output", help="Directory for CSV and plot outputs.")
     parser.add_argument("--plots", action="store_true", help="Generate diagnostic plots.")
     parser.add_argument("--no-align", action="store_true", help="Disable image alignment.")
+    parser.add_argument("--crop", type=int, default=None, metavar="PIXELS",
+                        help="Pixels to remove from each edge before processing. "
+                             "Overrides 'edge_crop' in the config file.")
+    parser.add_argument("--align-mode", choices=["affine", "translation"], default=None,
+                        help="Alignment mode: 'affine' applies the full transform "
+                             "(rotation + scale + translation, best for wide-field); "
+                             "'translation' applies an integer-pixel shift only (faster). "
+                             "Overrides 'align_mode' in the config file.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     if args.no_align:
         cfg["align"] = False
+    if args.crop is not None:
+        cfg["edge_crop"] = args.crop
+    if args.align_mode is not None:
+        cfg["align_mode"] = args.align_mode
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -60,8 +72,36 @@ def main():
         sys.exit(1)
     log.info(f"Found {len(fits_files)} FITS files. Reference: {fits_files[0].name}")
 
+    edge_crop = int(cfg.get("edge_crop", 0))
+    if edge_crop < 0:
+        log.error("edge_crop must be >= 0.")
+        sys.exit(1)
+
+    align_mode = cfg.get("align_mode", "affine")
+    if align_mode not in ("affine", "translation"):
+        log.error(f"align_mode must be 'affine' or 'translation', got '{align_mode}'.")
+        sys.exit(1)
+    full_affine = align_mode == "affine"
+    log.info(f"Alignment mode: {align_mode}")
+
+    def apply_crop(arr: np.ndarray) -> np.ndarray:
+        """Slice *edge_crop* pixels from each edge; no-op when edge_crop is 0."""
+        if edge_crop == 0:
+            return arr
+        ny, nx = arr.shape
+        if 2 * edge_crop >= ny or 2 * edge_crop >= nx:
+            log.error(
+                f"edge_crop={edge_crop} >= half the image size ({ny}×{nx}). "
+                "Reduce edge_crop."
+            )
+            sys.exit(1)
+        return arr[edge_crop: ny - edge_crop, edge_crop: nx - edge_crop]
+
+    if edge_crop:
+        log.info(f"Cropping {edge_crop} pixels from each edge.")
+
     # Detect sources in reference image
-    ref_data = read_fits(fits_files[0], cfg["fits_extension"])
+    ref_data = apply_crop(read_fits(fits_files[0], cfg["fits_extension"]))
     positions = detect_sources(ref_data, cfg["detection_fwhm"], cfg["detection_threshold"])
     source_ids = np.arange(len(positions))
 
@@ -75,14 +115,14 @@ def main():
     records = []
     for i, fits_path in enumerate(fits_files):
         log.info(f"[{i+1}/{len(fits_files)}] {fits_path.name}")
-        data = read_fits(fits_path, cfg["fits_extension"])
+        data = apply_crop(read_fits(fits_path, cfg["fits_extension"]))
         obs_time = read_fits_datetime(fits_path, cfg["fits_extension"])
 
         # Align if requested and not the reference
         bad_mask = None
         frame_positions = positions  # default: use reference positions as-is
         if cfg["align"] and i > 0:
-            aligned, bad_mask, shift_xy = align_image(data, ref_data)
+            aligned, bad_mask, shift_xy = align_image(data, ref_data, full_affine=full_affine)
             if aligned is None:
                 for sid, (x, y) in zip(source_ids, positions):
                     records.append({
@@ -155,7 +195,8 @@ def main():
     df = apply_coverage_filter(df, cfg["coverage_min_fraction"])
 
     # Temporal SNR per source
-    df = compute_temporal_snr(df)
+    snr_window = int(cfg.get("temporal_snr_window", 0))
+    df = compute_temporal_snr(df, window=snr_window)
 
     # Optional: reference image plot (after filter so we can colour-code kept vs dropped)
     if args.plots:
