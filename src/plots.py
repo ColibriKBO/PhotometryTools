@@ -344,3 +344,39 @@ def plot_differential_lightcurves(df: pd.DataFrame, output_dir: Path) -> None:
         plt.close(fig)
 
     log.info(f"Differential light curve plots saved to {output_dir}")
+
+
+def plot_stacked_image(stack: np.ndarray, output_path: Path) -> None:
+    """Save a mean-stacked image as a PNG with ZScale stretch.
+
+    Parameters
+    ----------
+    stack : ndarray
+        2-D mean-stacked science image (may contain NaN for uncovered pixels).
+    output_path : Path
+        Destination PNG file path.
+    """
+    import matplotlib
+    matplotlib.use(_MPL_BACKEND)
+    import matplotlib.pyplot as plt
+    from astropy.visualization import ZScaleInterval
+
+    interval = ZScaleInterval()
+    finite = stack[np.isfinite(stack)]
+    if finite.size > 0:
+        vmin, vmax = interval.get_limits(finite)
+    else:
+        vmin, vmax = 0.0, 1.0
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.imshow(
+        stack, origin="lower", cmap="gray",
+        vmin=vmin, vmax=vmax, interpolation="nearest",
+    )
+    ax.set_title("Mean-Stacked Image", fontsize=14)
+    ax.set_xlabel("X (px)")
+    ax.set_ylabel("Y (px)")
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    log.info(f"Saved mean-stacked image → {output_path}")
