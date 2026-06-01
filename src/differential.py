@@ -159,22 +159,19 @@ def _build_ref_matrices(
     weights = compute_snr_weights(df, reference_ids)
     ref_df = df[df["source_id"].isin(reference_ids)].copy()
 
-    # Complete epoch index — preserves epochs where all refs are NaN
-    all_epochs = (
-        df[["filename", "obs_time"]]
-        .drop_duplicates()
-        .set_index(["filename", "obs_time"])
-        .index
-    )
+    # Use filename as the epoch key. Some photometry tables have missing or
+    # non-parseable obs_time values, and pivoting on a NaN-valued index would
+    # drop every epoch. Filenames are already unique per exposure.
+    all_epochs = df[["filename"]].drop_duplicates().set_index("filename").index
 
     mag_pivot = ref_df.pivot_table(
-        index=["filename", "obs_time"],
+        index="filename",
         columns="source_id",
         values="mag",
         aggfunc="first",
     ).reindex(all_epochs)
     err_pivot = ref_df.pivot_table(
-        index=["filename", "obs_time"],
+        index="filename",
         columns="source_id",
         values="mag_err",
         aggfunc="first",
@@ -209,7 +206,14 @@ def _build_ref_matrices(
     ref_err = np.sqrt((w_norm ** 2 * err_filled ** 2).sum(axis=1))
     ref_err[W_sum == 0] = np.nan
 
-    epoch_index = mag_pivot.reset_index()[["filename", "obs_time"]].copy()
+    epoch_index = mag_pivot.reset_index()[["filename"]].copy()
+    if "obs_time" in df.columns:
+        obs_lookup = (
+            df[["filename", "obs_time"]]
+            .drop_duplicates(subset="filename")
+            .set_index("filename")
+        )
+        epoch_index["obs_time"] = epoch_index["filename"].map(obs_lookup["obs_time"])
 
     return {
         "epoch_index": epoch_index,
@@ -606,7 +610,7 @@ def compute_differential_lightcurves(
             ref_for_target["ref_mag"] = mats["ref_mag"]
             ref_for_target["ref_mag_err"] = mats["ref_err"]
 
-        merged = src_rows.merge(ref_for_target, on=["filename", "obs_time"], how="left")
+        merged = src_rows.merge(ref_for_target, on="filename", how="left")
 
         # Subtract this target's temporal median so the differential is in
         # "deviation from mean" space, matching how the reference was built.

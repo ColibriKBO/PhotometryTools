@@ -44,8 +44,9 @@ def measure_aperture_photometry(
         Detector gain (e⁻/ADU), used for Poisson noise estimation.
     bad_mask : bool ndarray, optional
         True where pixels are invalid (e.g. outside dither overlap after
-        alignment).  Any aperture or annulus overlapping a bad pixel is
-        set to NaN in the output.
+        alignment).  Any aperture or annulus overlapping this edge mask is
+        set to NaN in the output.  NaNs already present inside the image are
+        ignored rather than being treated as a hard failure.
 
     Returns
     -------
@@ -68,7 +69,11 @@ def measure_aperture_photometry(
         ap_invalid = np.zeros(len(positions), dtype=bool)
         ann_invalid = np.zeros(len(positions), dtype=bool)
 
-    data_clean = np.where(bad_mask, 0.0, data) if bad_mask is not None else data
+    # Zero-fill all NaNs so in-frame bad pixels do not poison the aperture
+    # statistics.  Only the edge mask above is allowed to invalidate a source.
+    data_clean = np.nan_to_num(data, nan=0.0)
+    if bad_mask is not None:
+        data_clean = np.where(bad_mask, 0.0, data_clean)
 
     sky_stats = ApertureStats(data_clean, annuli)
     sky_per_pixel = sky_stats.median

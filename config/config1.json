@@ -1,0 +1,17 @@
+{
+    "aperture_radius": 5.0,
+    "annulus_r_in": 10.0,
+    "annulus_r_out": 19.0,
+    "detection_fwhm": 2.0,
+    "detection_threshold": 5.0,
+    "fits_extension": 0,
+    "align": true,
+    "coverage_min_fraction": 0.5,
+    "gain": 1.0,
+    "centroid_box_radius": 5,
+    "diff_method": "weighted_mean",
+    "min_reference_snr": 5.0,
+    "sigma_clip": 3.0,
+    "min_ref_stars": 3,
+    "bin_frames": 50
+}

@@ -57,7 +57,19 @@ def align_image(
             mode="constant",
             cval=np.nan,
         )
-        bad_mask = ~np.isfinite(shifted)
+        # Track only pixels that became invalid because of the shift itself.
+        # Pre-existing NaNs in the source frame are kept in `shifted` for
+        # photometric handling, but they should not be mistaken for lost edge
+        # coverage.
+        source_coverage = np.ones_like(source, dtype=np.float64)
+        shifted_valid = ndi_shift(
+            source_coverage,
+            shift=(dy, dx),
+            order=0,
+            mode="constant",
+            cval=0.0,
+        ) > 0.5
+        bad_mask = ~shifted_valid
         return shifted, bad_mask, (dx, dy)
     except Exception as e:
         log.warning(f"Alignment failed: {e}. Photometry for this image will be NaN.")
@@ -119,13 +131,26 @@ def recentroid_positions(
             continue
 
         cutout = data[y0:y1, x0:x1].copy()
-        cutout[~np.isfinite(cutout)] = 0.0
+        finite = np.isfinite(cutout)
+        if not finite.any():
+            continue
+        cutout[~finite] = 0.0
 
-        if cutout.sum() <= 0:
+        # Use a non-negative weight image to keep centroiding stable
+        # when background subtraction makes the cutout sum non-positive.
+        min_val = np.nanmin(cutout)
+        if not np.isfinite(min_val):
+            continue
+        weights = cutout - min_val
+
+        if weights.sum() <= 0:
+            # Fall back to the reference position if centroiding is ill-posed.
+            new_positions[i] = [x, y]
             continue
 
-        cx, cy = centroid_com(cutout)
+        cx, cy = centroid_com(weights)
         if not (np.isfinite(cx) and np.isfinite(cy)):
+            new_positions[i] = [x, y]
             continue
 
         new_positions[i] = [x0 + cx, y0 + cy]

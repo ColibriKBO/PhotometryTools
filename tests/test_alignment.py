@@ -201,6 +201,18 @@ class TestAlignImage:
 
         np.testing.assert_array_equal(bad_mask, ~np.isfinite(shifted))
 
+    def test_internal_nan_is_not_treated_as_edge_loss(self):
+        """A pre-existing NaN in the source should not become an edge mask pixel."""
+        source = np.ones((32, 32))
+        source[16, 16] = np.nan
+        mock_transform = self._make_mock_transform(0.0, 0.0)
+
+        with patch("astroalign.find_transform", return_value=(mock_transform, None)):
+            shifted, bad_mask, _ = align_image(source, source)
+
+        assert np.isnan(shifted[16, 16])
+        assert not bad_mask[16, 16]
+
     def test_no_interpolated_pixel_values(self):
         """
         For an integer shift, every finite output pixel must exactly equal
