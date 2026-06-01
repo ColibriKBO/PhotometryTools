@@ -227,11 +227,17 @@ def plot_lightcurves(df: pd.DataFrame, output_dir: Path) -> None:
     log.info(f"Light curve plots saved to {output_dir}")
 
 
-def plot_differential_lightcurves(df: pd.DataFrame, output_dir: Path) -> None:
+def plot_differential_lightcurves(
+    df: pd.DataFrame,
+    output_dir: Path,
+    bin_frames: int = 10,
+) -> None:
     """Save one differential magnitude light-curve plot per source into *output_dir*.
 
     The plot shows ``diff_mag ± diff_mag_err`` vs observation time (or epoch
-    index).  Reference stars are indicated in the plot subtitle.
+    index).  Reference stars are indicated in the plot subtitle.  When
+    *bin_frames* > 0 a red line showing the running frame-averaged magnitude
+    (mean over consecutive groups of *bin_frames* valid points) is overlaid.
 
     Parameters
     ----------
@@ -243,6 +249,9 @@ def plot_differential_lightcurves(df: pd.DataFrame, output_dir: Path) -> None:
     output_dir : Path
         Directory into which ``source_NNNN_diff.png`` files are written
         (created if it does not exist).
+    bin_frames : int
+        Number of consecutive frames to average for the red binned line.
+        Set to 0 to suppress the binned line entirely.
     """
     import matplotlib
     matplotlib.use(_MPL_BACKEND)
@@ -292,6 +301,23 @@ def plot_differential_lightcurves(df: pd.DataFrame, output_dir: Path) -> None:
             capsize=3, markersize=4, linewidth=0.8,
         )
         ax.axhline(0.0, color="gray", linewidth=0.8, linestyle="--", alpha=0.6)
+
+        # Rolling median smoothing overlay
+        if bin_frames > 0 and valid.sum() >= bin_frames:
+            vx = xvals[valid]
+            vy = diff_mag[valid]
+            smooth_y = (
+                pd.Series(vy)
+                .rolling(bin_frames, center=True, min_periods=1)
+                .median()
+                .values
+            )
+            ax.plot(
+                vx, smooth_y,
+                color="red", linewidth=1.5, linestyle="--", zorder=3,
+                label=f"{bin_frames}-frame rolling median",
+            )
+            ax.legend(fontsize=9, loc="upper right")
 
         # Set y-axis limits from the data values only — error bar extents are
         # excluded so that large uncertainties on a few epochs don't collapse

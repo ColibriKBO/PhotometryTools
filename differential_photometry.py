@@ -121,6 +121,17 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="Save differential light curve PNG plots.",
     )
+    parser.add_argument(
+        "--bin-frames",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Number of frames for the rolling-median smoothing line overlaid "
+            "on each differential light curve plot.  Overrides config.  Set "
+            "to 0 to suppress the line."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -140,11 +151,14 @@ def main(argv=None) -> None:
         cfg["sigma_clip"] = args.sigma_clip
     if args.min_ref_stars is not None:
         cfg["min_ref_stars"] = args.min_ref_stars
+    if args.bin_frames is not None:
+        cfg["bin_frames"] = args.bin_frames
 
     method = cfg.get("diff_method", "weighted_mean")
     min_ref_snr = float(cfg.get("min_reference_snr", 10.0))
     sigma_clip = cfg.get("sigma_clip", 3.0)
     min_ref_stars = int(cfg.get("min_ref_stars", 3))
+    bin_frames = int(cfg.get("bin_frames", 10))
 
     log.info(f"Method: {method}  |  Min reference SNR: {min_ref_snr}")
 
@@ -226,7 +240,7 @@ def main(argv=None) -> None:
     if args.plots:
         plot_dir = output_dir / "differential_lightcurves"
         log.info(f"Generating plots in {plot_dir} ...")
-        plot_differential_lightcurves(diff_df, plot_dir)
+        plot_differential_lightcurves(diff_df, plot_dir, bin_frames=bin_frames)
         log.info("Plotting complete.")
 
     log.info("Done.")
